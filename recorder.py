@@ -257,7 +257,12 @@ def _notify_relay(session_id: str, amplinar_id: str, recording_url: str) -> None
     try:
         resp = requests.post(
             f"{RELAY_URL}/api/session/recording-complete",
-            json={"sessionId": session_id, "amplinarId": amplinar_id, "recordingUrl": recording_url},
+            json={
+                "session_id": session_id,
+                "amplinar_id": amplinar_id,
+                "s3_url": recording_url,
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            },
             headers={"x-api-key": RELAY_API_KEY},
             timeout=10,
         )

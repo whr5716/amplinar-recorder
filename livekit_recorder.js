@@ -151,8 +151,8 @@ function startAudioCapture(track) {
         const { done, value: frameEvent } = await reader.read();
         if (done || stopping) break;
         try {
-          // frameEvent = { frame: AudioFrame, timestampUs }
-          const frame = frameEvent.frame;
+          // AudioStream enqueues AudioFrame directly (not a wrapper like VideoStream)
+          const frame = frameEvent; // frameEvent IS the AudioFrame
           // AudioFrame.data is an Int16Array of PCM samples
           const buf = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
           fs.writeSync(audioFd, buf);

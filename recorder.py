@@ -187,9 +187,15 @@ def _recording_worker(rec: dict) -> None:
                 output_path,
             ],
             env=env,
+            stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
+        # Give FFmpeg a moment to open inputs and confirm it started
+        time.sleep(2)
+        if ffmpeg_proc.poll() is not None:
+            stderr_out = ffmpeg_proc.stderr.read().decode(errors='replace')
+            raise RuntimeError(f"FFmpeg exited immediately: {stderr_out[-500:]}")
         rec["ffmpeg_proc"] = ffmpeg_proc
         rec["started_at"] = datetime.now(timezone.utc).isoformat()
         rec["status"] = "recording"
@@ -204,18 +210,33 @@ def _recording_worker(rec: dict) -> None:
         rec["status"] = "error"
         rec["error"] = str(e)
     finally:
-        # Stop FFmpeg gracefully (send 'q' to stdin)
+        # Stop FFmpeg gracefully: send 'q\n' to stdin so it finalizes the MP4
         if ffmpeg_proc and ffmpeg_proc.poll() is None:
             try:
-                ffmpeg_proc.stdin  # may be None
-                ffmpeg_proc.terminate()
-                ffmpeg_proc.wait(timeout=15)
+                ffmpeg_proc.stdin.write(b"q\n")
+                ffmpeg_proc.stdin.flush()
+                ffmpeg_proc.stdin.close()
+                ffmpeg_proc.wait(timeout=30)
+                logger.info(f"[Recorder:{session_id}] FFmpeg finalized cleanly")
             except Exception as e:
-                logger.warning(f"[Recorder:{session_id}] FFmpeg stop error: {e}")
+                logger.warning(f"[Recorder:{session_id}] FFmpeg graceful stop failed ({e}), sending SIGINT")
                 try:
-                    ffmpeg_proc.kill()
+                    import signal as _signal
+                    ffmpeg_proc.send_signal(_signal.SIGINT)
+                    ffmpeg_proc.wait(timeout=15)
                 except Exception:
-                    pass
+                    try:
+                        ffmpeg_proc.kill()
+                    except Exception:
+                        pass
+        elif ffmpeg_proc:
+            # FFmpeg already exited — log stderr for diagnosis
+            try:
+                stderr_out = ffmpeg_proc.stderr.read().decode(errors='replace')
+                if stderr_out:
+                    logger.warning(f"[Recorder:{session_id}] FFmpeg stderr: {stderr_out[-500:]}")
+            except Exception:
+                pass
 
         # Stop Chromium
         if chromium_proc and chromium_proc.poll() is None:

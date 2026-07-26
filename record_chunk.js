@@ -113,6 +113,31 @@ function sleep(ms) {
       console.log("[chunk] Join gate not found or already dismissed:", gateErr.message);
     }
 
+    // ── Background gate watcher ───────────────────────────────────────────────
+    // The viewer page shows a "Tap to Rejoin" or "Tap to Begin" overlay whenever
+    // it needs a user gesture to unlock AudioContext/autoplay. Poll for these
+    // overlays every 3 seconds and click through them automatically.
+    const gateWatcher = setInterval(async () => {
+      if (_stopping) { clearInterval(gateWatcher); return; }
+      try {
+        const clicked = await page.evaluate(() => {
+          const gates = [
+            { id: 'session-tap-gate', btn: 'button[onclick="sessionTapUnlock()"]' },
+            { id: 'ios-start-gate',   btn: 'button[onclick="iosStartTap()"]' },
+          ];
+          for (const g of gates) {
+            const el = document.getElementById(g.id);
+            if (el && (el.style.display === 'flex' || el.style.display === 'block')) {
+              const btn = document.querySelector(g.btn);
+              if (btn) { btn.click(); return g.id; }
+            }
+          }
+          return null;
+        });
+        if (clicked) console.log('[chunk] Clicked through gate:', clicked);
+      } catch (_) { /* page may be navigating */ }
+    }, 3000);
+
     // ── Start recording ───────────────────────────────────────────────────────
     const cdp = await page.createCDPSession();
     await cdp.send("Browserless.startRecording");
@@ -127,6 +152,7 @@ function sleep(ms) {
       };
     });
 
+    clearInterval(gateWatcher);
     console.log("[chunk] Stopping recording");
     const response = await cdp.send("Browserless.stopRecording", { encoding: "base64" });
     const rawBytes = Buffer.from(response.value, "base64");

@@ -94,21 +94,35 @@ function startVideoCapture(track) {
   console.log('[lk-rec] Starting video capture');
   videoStream = new VideoStream(track);
 
+  // VideoStream is a ReadableStream — must use getReader(), not for-await-of
+  const reader = videoStream.getReader();
+
   // Detached async loop — runs independently of the event emitter
   (async () => {
     try {
-      for await (const frame of videoStream) {
-        if (stopping) break;
+      while (!stopping) {
+        const { done, value: frameEvent } = await reader.read();
+        if (done || stopping) break;
         try {
-          const i420 = frame.buffer.toI420();
+          // frameEvent = { frame: VideoFrame, timestampUs, rotation }
+          const frame = frameEvent.frame;
+          // Convert to I420 for raw YUV output to FFmpeg
+          const { VideoBufferType } = require('@livekit/rtc-node');
+          const i420 = frame.convert(VideoBufferType.I420);
           actualWidth  = i420.width;
           actualHeight = i420.height;
-          fs.writeSync(videoFd, Buffer.from(i420.dataY));
-          fs.writeSync(videoFd, Buffer.from(i420.dataU));
-          fs.writeSync(videoFd, Buffer.from(i420.dataV));
-          videoFrameCount++;
-          if (videoFrameCount % 300 === 0) {
-            console.log(`[lk-rec] Video frames: ${videoFrameCount} (${actualWidth}x${actualHeight})`);
+          // I420 planes: Y (full res), U (quarter), V (quarter)
+          const yPlane = i420.getPlane(0);
+          const uPlane = i420.getPlane(1);
+          const vPlane = i420.getPlane(2);
+          if (yPlane && uPlane && vPlane) {
+            fs.writeSync(videoFd, Buffer.from(yPlane));
+            fs.writeSync(videoFd, Buffer.from(uPlane));
+            fs.writeSync(videoFd, Buffer.from(vPlane));
+            videoFrameCount++;
+            if (videoFrameCount % 300 === 0) {
+              console.log(`[lk-rec] Video frames: ${videoFrameCount} (${actualWidth}x${actualHeight})`);
+            }
           }
         } catch (e) {
           if (!stopping) console.error('[lk-rec] Video frame error:', e.message);
@@ -116,6 +130,8 @@ function startVideoCapture(track) {
       }
     } catch (e) {
       if (!stopping) console.error('[lk-rec] Video stream error:', e.message);
+    } finally {
+      try { reader.releaseLock(); } catch (_) {}
     }
     console.log(`[lk-rec] Video capture ended (${videoFrameCount} frames)`);
   })();
@@ -125,13 +141,20 @@ function startAudioCapture(track) {
   console.log('[lk-rec] Starting audio capture');
   audioStream = new AudioStream(track, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS);
 
+  // AudioStream is also a ReadableStream — must use getReader()
+  const reader = audioStream.getReader();
+
   // Detached async loop — runs independently of the event emitter
   (async () => {
     try {
-      for await (const frame of audioStream) {
-        if (stopping) break;
+      while (!stopping) {
+        const { done, value: frameEvent } = await reader.read();
+        if (done || stopping) break;
         try {
-          const buf = Buffer.from(frame.data.buffer);
+          // frameEvent = { frame: AudioFrame, timestampUs }
+          const frame = frameEvent.frame;
+          // AudioFrame.data is an Int16Array of PCM samples
+          const buf = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
           fs.writeSync(audioFd, buf);
           audioFrameCount++;
         } catch (e) {
@@ -140,6 +163,8 @@ function startAudioCapture(track) {
       }
     } catch (e) {
       if (!stopping) console.error('[lk-rec] Audio stream error:', e.message);
+    } finally {
+      try { reader.releaseLock(); } catch (_) {}
     }
     console.log(`[lk-rec] Audio capture ended (${audioFrameCount} frames)`);
   })();
@@ -153,8 +178,8 @@ async function gracefulStop() {
   console.log('[lk-rec] Stopping capture...');
 
   // Close streams (this ends the for-await loops)
-  if (videoStream) { try { videoStream.close(); } catch (_) {} }
-  if (audioStream) { try { audioStream.close(); } catch (_) {} }
+  if (videoStream) { try { videoStream.cancel(); } catch (_) {} }
+  if (audioStream) { try { audioStream.cancel(); } catch (_) {} }
 
   // Small delay to let the loops drain their last frames
   await new Promise(r => setTimeout(r, 500));

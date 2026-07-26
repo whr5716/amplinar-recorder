@@ -170,14 +170,28 @@ def _concat_segments(segment_paths: list) -> bytes:
 
 
 # ── LiveKit recorder subprocess ───────────────────────────────────────────────
-def _start_lk_subprocess(lk_url: str, lk_token: str, output_path: str) -> subprocess.Popen:
+SEGMENT_MINUTES = int(os.environ.get("RECORDER_SEGMENT_MINUTES", "5"))
+
+
+def _start_lk_subprocess(lk_url: str, room_name: str, output_path: str,
+                         session_id: str = "", amplinar_id: str = "") -> subprocess.Popen:
     """Spawn livekit_recorder.js and return the Popen object.
     Starts a background thread that streams stdout live so logs appear
     in Railway in real time rather than only after SIGTERM.
     """
+    port = int(os.environ.get("PORT", 8080))
+    callback_url = f"http://localhost:{port}/segment-complete"
     env = os.environ.copy()
     proc = subprocess.Popen(
-        ["node", LK_RECORDER_JS, lk_url, lk_token, output_path],
+        [
+            "node", LK_RECORDER_JS,
+            lk_url, room_name, output_path,
+            f"--segment-minutes={SEGMENT_MINUTES}",
+            f"--callback-url={callback_url}",
+            f"--callback-key={RECORDER_API_KEY}",
+            f"--session-id={session_id}",
+            f"--amplinar-id={amplinar_id}",
+        ],
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -329,9 +343,10 @@ def _recording_worker(rec: dict) -> None:
         tf = tempfile.NamedTemporaryFile(suffix="_lk.webm", delete=False)
         tf.close()
         lk_out = tf.name
-        # Pass room name — livekit_recorder.js now generates its own token
-        # internally using livekit-server-sdk (same as relay) to avoid 401 errors
-        lk_proc = _start_lk_subprocess(LIVEKIT_URL, room_name, lk_out)
+        lk_proc = _start_lk_subprocess(
+            LIVEKIT_URL, room_name, lk_out,
+            session_id=session_id, amplinar_id=amplinar_id
+        )
         logger.info(f"[Recorder:{session_id}] LiveKit segment started → {lk_out}")
 
     def _stop_lk_segment():
@@ -456,6 +471,50 @@ def _recording_worker(rec: dict) -> None:
                 ws.close()
             except Exception:
                 pass
+
+
+# ── Segment-complete callback (called by livekit_recorder.js) ────────────────
+@app.route("/segment-complete", methods=["POST"])
+def segment_complete():
+    """Called by livekit_recorder.js when a rolling segment is ready.
+    Uploads the merged segment WebM to S3 immediately.
+    """
+    if RECORDER_API_KEY and request.headers.get("X-Recorder-Key") != RECORDER_API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data        = request.get_json() or {}
+    session_id  = data.get("session_id", "unknown")
+    amplinar_id = data.get("amplinar_id", "unknown")
+    seg_idx     = data.get("segment_index", 0)
+    video_path  = data.get("video_path", "")
+
+    if not video_path or not os.path.exists(video_path):
+        logger.warning(f"[Segment] Segment {seg_idx} path not found: {video_path}")
+        return jsonify({"error": "file not found"}), 404
+
+    sz = os.path.getsize(video_path)
+    logger.info(f"[Segment] Uploading segment {seg_idx} ({sz} bytes) for session {session_id}")
+
+    def _upload():
+        try:
+            with open(video_path, "rb") as f:
+                data_bytes = f.read()
+            now    = datetime.now(timezone.utc)
+            s3_key = f"amplinar-recordings/{amplinar_id}/{now.strftime('%Y%m%d_%H%M%S')}_seg{seg_idx:03d}_{session_id}.webm"
+            url    = upload_to_s3(data_bytes, s3_key)
+            logger.info(f"[Segment] Segment {seg_idx} uploaded: {url}")
+            # Notify relay of partial recording
+            _notify_relay(session_id, amplinar_id, url)
+        except Exception as e:
+            logger.error(f"[Segment] Upload failed for segment {seg_idx}: {e}")
+        finally:
+            try:
+                os.unlink(video_path)
+            except Exception:
+                pass
+
+    threading.Thread(target=_upload, daemon=True).start()
+    return jsonify({"status": "uploading", "segment_index": seg_idx})
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────

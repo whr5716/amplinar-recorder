@@ -124,24 +124,33 @@ def _recording_worker(rec: dict) -> None:
         time.sleep(1.5)  # Give Xvfb time to start
 
         # 1b. Start PulseAudio virtual audio sink (needed for FFmpeg audio capture)
+        pulse_socket = "/tmp/pulse-socket"
+        env["PULSE_SERVER"] = f"unix:{pulse_socket}"
         try:
+            # Start PulseAudio with a unix socket so all child processes can find it
             subprocess.run(
-                ["pulseaudio", "--start", "--daemonize=yes", "--exit-idle-time=-1"],
+                [
+                    "pulseaudio",
+                    "--start",
+                    "--daemonize=yes",
+                    "--exit-idle-time=-1",
+                    f"--load=module-native-protocol-unix auth-anonymous=1 socket={pulse_socket}",
+                ],
                 env=env, check=True, capture_output=True, timeout=10
             )
-            time.sleep(1)  # Give PulseAudio time to start
+            time.sleep(2)  # Give PulseAudio time to start and bind socket
             # Load a null sink so FFmpeg always has an audio source
-            subprocess.run(
+            r1 = subprocess.run(
                 ["pactl", "load-module", "module-null-sink", "sink_name=virtual"],
                 env=env, capture_output=True, timeout=5
             )
-            subprocess.run(
+            r2 = subprocess.run(
                 ["pactl", "set-default-source", "virtual.monitor"],
                 env=env, capture_output=True, timeout=5
             )
-            logger.info(f"[Recorder:{session_id}] PulseAudio started with virtual sink")
+            logger.info(f"[Recorder:{session_id}] PulseAudio started (null-sink={r1.returncode}, default-src={r2.returncode})")
         except Exception as pa_err:
-            logger.warning(f"[Recorder:{session_id}] PulseAudio start failed (will use silent audio): {pa_err}")
+            logger.warning(f"[Recorder:{session_id}] PulseAudio start failed: {pa_err}")
 
         # 2. Start Chromium (headless=false so it renders to the virtual display)
         logger.info(f"[Recorder:{session_id}] Starting Chromium → {viewer_url}")

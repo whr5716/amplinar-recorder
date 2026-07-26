@@ -128,7 +128,7 @@ def _recording_worker(rec: dict) -> None:
         f"&headless=false"
         f"&stealth"
         f"&record=true"
-        f"&timeout=1800000"
+        f"&timeout=900000"
     )
 
     logger.info(f"[Recorder:{session_id}] Connecting to Browserless (record=true)")

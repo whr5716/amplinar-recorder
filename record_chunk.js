@@ -148,10 +148,45 @@ function sleep(ms) {
       } catch (_) { /* page may be navigating */ }
     }, 3000);
 
+    // ── Wait for video to be ready before recording ──────────────────────────
+    // The LiveKit video track can subscribe/unsubscribe multiple times on connect.
+    // Poll until the video element has actual frame data (readyState >= 2 and
+    // videoWidth > 0) before starting the recording, so we don't capture a blank frame.
+    // Give up after 20 seconds and start anyway (audio will still be captured).
+    console.log('[chunk] Waiting for avatar video to be ready...');
+    const videoReady = await (async () => {
+      const deadline = Date.now() + 20000;
+      while (Date.now() < deadline) {
+        if (_stopping) return false;
+        try {
+          const state = await page.evaluate(() => {
+            // Find the LK video element — it's moved into .video-wrapper when active
+            const wrapper = document.querySelector('.video-wrapper');
+            if (!wrapper) return { rs: -1, vw: 0 };
+            const vids = wrapper.querySelectorAll('video');
+            for (const v of vids) {
+              if (v.srcObject || v.readyState >= 1) {
+                return { rs: v.readyState, vw: v.videoWidth, vh: v.videoHeight };
+              }
+            }
+            return { rs: -1, vw: 0 };
+          });
+          console.log(`[chunk] Video state: readyState=${state.rs} videoWidth=${state.vw}`);
+          if (state.rs >= 2 && state.vw > 0) {
+            console.log('[chunk] Avatar video ready — starting recording');
+            return true;
+          }
+        } catch (_) { /* page may be navigating */ }
+        await sleep(1000);
+      }
+      console.log('[chunk] Video not ready after 20s — starting recording anyway');
+      return false;
+    })();
+
     // ── Start recording ───────────────────────────────────────────────────────
     const cdp = await page.createCDPSession();
     await cdp.send("Browserless.startRecording");
-    console.log("[chunk] Recording started");
+    console.log("[chunk] Recording started (videoReady=" + videoReady + ")");
 
     // Wait for duration OR early stop signal
     await new Promise(resolve => {

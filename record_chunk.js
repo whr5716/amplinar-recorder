@@ -74,6 +74,16 @@ function sleep(ms) {
     const page  = pages.length > 0 ? pages[0] : await browser.newPage();
 
     await page.setViewport({ width: 1280, height: 720 });
+
+    // Capture browser console logs so we can diagnose LiveKit/video issues
+    page.on('console', msg => {
+      const type = msg.type();
+      const text = msg.text();
+      if (type === 'error' || text.includes('[LK]') || text.includes('[chunk]') || text.includes('Video') || text.includes('audio') || text.includes('play()') || text.includes('NotAllowed') || text.includes('readyState')) {
+        console.log(`[page:${type}] ${text}`);
+      }
+    });
+
     await page.goto(viewerUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
 
     // ── Auto-join the session gate ────────────────────────────────────────────

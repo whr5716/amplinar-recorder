@@ -1,0 +1,9 @@
+{
+  "name": "amplinar-recorder-lk",
+  "version": "1.0.0",
+  "description": "LiveKit direct track recorder for Amplinar sessions",
+  "main": "livekit_recorder.js",
+  "dependencies": {
+    "@livekit/rtc-node": "^0.13.31"
+  }
+}

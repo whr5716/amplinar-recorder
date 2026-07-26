@@ -1,25 +1,24 @@
 """
-Amplinar Recorder Service
-=========================
-Records a live Amplinar session using overlapping Browserless chunks stitched
-together with FFmpeg — no audible gaps.
+Amplinar Recorder Service — LiveKit Direct Capture
+===================================================
+Records a live Amplinar session by connecting directly to the LiveKit room
+and capturing avatar video + audio tracks. Video segments (played locally
+in viewer browsers) are downloaded by URL and spliced in at the correct
+position. All segments are stitched with FFmpeg into one final WebM file
+and uploaded to S3.
 
-Each chunk is recorded by a Node.js subprocess (record_chunk.js) using
-Puppeteer-core. When /stop is called, the current chunk subprocess receives
-SIGTERM, which triggers record_chunk.js to stop recording early and save
-whatever was captured.
-
-Strategy
---------
-- CHUNK_DURATION seconds per chunk (default 810s = 13.5 min, under 15-min limit)
-- OVERLAP seconds before a chunk ends, the next chunk starts (default 20s)
-- First OVERLAP seconds of each chunk after the first are trimmed by record_chunk.js
-- FFmpeg concat demuxer joins all chunks seamlessly
-- On /stop: SIGTERM sent to current chunk subprocess → it saves early → concat + upload
+Architecture
+------------
+- On /start: generate a LiveKit access token for the recorder participant,
+  spawn livekit_recorder.js to capture the room's audio+video tracks
+- Listen to the relay WebSocket for segment events:
+    video_segment      → pause LiveKit capture, download the video file
+    video_segment_end  → resume LiveKit capture
+- On /stop: SIGTERM the Node.js worker, stitch all segments, upload to S3
 
 API
 ---
-  POST /start   { "viewer_url": "...", "session_id": "...", "amplinar_id": "..." }
+  POST /start   { "session_id": "...", "amplinar_id": "...", "room_name": "..." }
   POST /stop    { "session_id": "..." }
   GET  /status
   GET  /health
@@ -32,12 +31,17 @@ import signal
 import subprocess
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
 import boto3
 import requests
+import websocket  # websocket-client
 from flask import Flask, jsonify, request
+
+# LiveKit token generation
+import jwt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("amplinar-recorder")
@@ -45,18 +49,18 @@ logger = logging.getLogger("amplinar-recorder")
 app = Flask(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BROWSERLESS_API_KEY  = os.environ.get("BROWSERLESS_API_KEY", "")
+LIVEKIT_URL          = os.environ.get("LIVEKIT_URL", "")
+LIVEKIT_API_KEY      = os.environ.get("LIVEKIT_API_KEY", "")
+LIVEKIT_API_SECRET   = os.environ.get("LIVEKIT_API_SECRET", "")
 RECORDER_API_KEY     = os.environ.get("RECORDER_API_KEY", "")
 S3_ACCESS_KEY_ID     = os.environ.get("S3_ACCESS_KEY_ID", "")
 S3_SECRET_ACCESS_KEY = os.environ.get("S3_SECRET_ACCESS_KEY", "")
 S3_BUCKET_NAME       = os.environ.get("S3_BUCKET_NAME", "wholesalehotelrates-images")
 S3_REGION            = os.environ.get("S3_REGION", "us-east-1")
 RELAY_URL            = os.environ.get("RELAY_URL", "")
-RELAY_API_KEY        = os.environ.get("RELAY_API_KEY", "")
-CHUNK_DURATION       = int(os.environ.get("CHUNK_DURATION", "810"))   # seconds
-OVERLAP              = int(os.environ.get("OVERLAP", "20"))            # seconds
+RELAY_API_KEY        = os.environ.get("RECORDER_API_KEY", "")  # use RECORDER_API_KEY for callback auth
 
-CHUNK_JS = os.path.join(os.path.dirname(__file__), "record_chunk.js")
+LK_RECORDER_JS = os.path.join(os.path.dirname(__file__), "livekit_recorder.js")
 
 # ── State ─────────────────────────────────────────────────────────────────────
 _recording: Optional[dict] = None
@@ -70,76 +74,25 @@ def check_auth() -> bool:
     return request.headers.get("X-Recorder-Key") == RECORDER_API_KEY
 
 
-# ── Record one chunk via Node.js subprocess ───────────────────────────────────
-def _record_chunk_subprocess(
-    viewer_url: str,
-    duration_secs: int,
-    trim_secs: int,
-    output_path: str,
-    proc_holder: dict,          # {"proc": None} — filled in so caller can SIGTERM
-) -> None:
-    """
-    Launches record_chunk.js as a Popen subprocess and waits for it.
-    Stores the Popen object in proc_holder["proc"] so the stop handler
-    can send SIGTERM to trigger early-stop recording.
-    Raises RuntimeError on failure.
-    """
-    env = os.environ.copy()
-    env["BROWSERLESS_API_KEY"] = BROWSERLESS_API_KEY
-
-    proc = subprocess.Popen(
-        [
-            "node",
-            CHUNK_JS,
-            viewer_url,
-            str(duration_secs * 1000),   # ms
-            str(trim_secs * 1000),        # ms
-            output_path,
-        ],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    proc_holder["proc"] = proc
-
-    stdout, stderr = proc.communicate(timeout=duration_secs + 120)
-
-    if stdout:
-        logger.info(f"[chunk stdout] {stdout.strip()}")
-    if proc.returncode != 0:
-        if stderr:
-            logger.error(f"[chunk stderr] {stderr.strip()}")
-        raise RuntimeError(
-            f"record_chunk.js exited {proc.returncode}: {stderr.strip()[-300:]}"
-        )
-
-
-# ── FFmpeg concat ─────────────────────────────────────────────────────────────
-def _concat_chunks(chunk_paths: list) -> bytes:
-    if len(chunk_paths) == 1:
-        with open(chunk_paths[0], "rb") as f:
-            return f.read()
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as listf:
-        for p in chunk_paths:
-            listf.write(f"file '{p}'\n")
-        list_path = listf.name
-
-    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as outf:
-        out_path = outf.name
-
-    try:
-        subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out_path],
-            check=True,
-            capture_output=True,
-        )
-        with open(out_path, "rb") as f:
-            return f.read()
-    finally:
-        os.unlink(list_path)
-        os.unlink(out_path)
+# ── LiveKit token ─────────────────────────────────────────────────────────────
+def _make_lk_token(room_name: str, identity: str = "amplinar-recorder") -> str:
+    """Generate a LiveKit access token for the recorder participant."""
+    now = int(time.time())
+    payload = {
+        "iss": LIVEKIT_API_KEY,
+        "sub": identity,
+        "iat": now,
+        "exp": now + 7200,  # 2 hours
+        "video": {
+            "room": room_name,
+            "roomJoin": True,
+            "canPublish": False,
+            "canSubscribe": True,
+            "canPublishData": False,
+            "hidden": True,   # don't show recorder in participant list
+        },
+    }
+    return jwt.encode(payload, LIVEKIT_API_SECRET, algorithm="HS256")
 
 
 # ── S3 upload ─────────────────────────────────────────────────────────────────
@@ -178,123 +131,285 @@ def _notify_relay(session_id: str, amplinar_id: str, recording_url: str) -> None
         logger.error(f"[Recorder] Relay notification failed: {e}")
 
 
-# ── Main recording worker ─────────────────────────────────────────────────────
-def _recording_worker(rec: dict) -> None:
-    """
-    Orchestrates overlapping chunks.
+# ── FFmpeg concat ─────────────────────────────────────────────────────────────
+def _concat_segments(segment_paths: list) -> bytes:
+    """Concatenate a list of WebM/MP4 segment files into one WebM."""
+    if len(segment_paths) == 1:
+        with open(segment_paths[0], "rb") as f:
+            return f.read()
 
-    Stop mechanism:
-      - stop_event is set by /stop
-      - current_proc_holder["proc"] holds the active Popen object
-      - When stop_event fires, we send SIGTERM to the subprocess, which
-        causes record_chunk.js to stop recording early and save the file
-      - We then wait for the subprocess to exit, concat, and upload
-    """
-    session_id  = rec["session_id"]
-    amplinar_id = rec["amplinar_id"]
-    viewer_url  = rec["viewer_url"]
-    stop_event  = rec["stop_event"]
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as listf:
+        for p in segment_paths:
+            listf.write(f"file '{p}'\n")
+        list_path = listf.name
 
-    if not BROWSERLESS_API_KEY:
-        rec["status"] = "error"
-        rec["error"]  = "BROWSERLESS_API_KEY not configured"
-        return
-
-    chunk_files: list = []
-    chunk_index = 0
-    current_proc_holder: dict = {"proc": None}
-    rec["_proc_holder"] = current_proc_holder   # expose so stop handler can SIGTERM
-
-    rec["started_at"] = datetime.now(timezone.utc).isoformat()
-    rec["status"]     = "recording"
-    logger.info(f"[Recorder:{session_id}] Starting (chunk={CHUNK_DURATION}s, overlap={OVERLAP}s)")
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as outf:
+        out_path = outf.name
 
     try:
-        while True:
-            trim = 0 if chunk_index == 0 else OVERLAP
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+             "-c:v", "libvpx", "-b:v", "1500k", "-deadline", "realtime", "-cpu-used", "8",
+             "-c:a", "libopus", "-b:a", "128k",
+             out_path],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            logger.error(f"[FFmpeg] concat failed: {result.stderr.decode()[-500:]}")
+            raise RuntimeError("FFmpeg concat failed")
+        with open(out_path, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.unlink(list_path)
+        except Exception:
+            pass
+        try:
+            os.unlink(out_path)
+        except Exception:
+            pass
 
-            # Create temp file for this chunk
-            tf = tempfile.NamedTemporaryFile(suffix=f"_chunk{chunk_index}.webm", delete=False)
-            tf.close()
-            chunk_path = tf.name
-            chunk_files.append(chunk_path)
 
-            chunk_result: dict = {}
-            chunk_done = threading.Event()
+# ── LiveKit recorder subprocess ───────────────────────────────────────────────
+def _start_lk_subprocess(lk_url: str, lk_token: str, output_path: str) -> subprocess.Popen:
+    """Spawn livekit_recorder.js and return the Popen object."""
+    env = os.environ.copy()
+    proc = subprocess.Popen(
+        ["node", LK_RECORDER_JS, lk_url, lk_token, output_path],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    logger.info(f"[Recorder] livekit_recorder.js started (pid={proc.pid})")
+    return proc
 
-            def _do_chunk(idx, path, trim_s, result, done, holder):
-                try:
-                    logger.info(f"[Recorder:{session_id}] Chunk {idx} start (trim={trim_s}s)")
-                    _record_chunk_subprocess(viewer_url, CHUNK_DURATION, trim_s, path, holder)
-                    result["ok"] = True
-                except Exception as ex:
-                    result["ok"]    = False
-                    result["error"] = str(ex)
-                finally:
-                    done.set()
 
-            t = threading.Thread(
-                target=_do_chunk,
-                args=(chunk_index, chunk_path, trim, chunk_result, chunk_done, current_proc_holder),
-                daemon=True,
-            )
-            t.start()
+def _stop_lk_subprocess(proc: subprocess.Popen, timeout: int = 120) -> bool:
+    """Send SIGTERM to the recorder subprocess and wait for it to finish."""
+    if proc.poll() is not None:
+        return True  # already done
+    try:
+        proc.send_signal(signal.SIGTERM)
+        logger.info(f"[Recorder] SIGTERM sent to pid={proc.pid}")
+    except Exception as e:
+        logger.warning(f"[Recorder] SIGTERM failed: {e}")
 
-            # Wait until OVERLAP seconds before this chunk ends, then start next
-            overlap_wait = CHUNK_DURATION - OVERLAP
-            stop_signalled = stop_event.wait(timeout=overlap_wait)
+    # Drain stdout while waiting
+    def _drain():
+        for line in proc.stdout:
+            logger.info(f"[lk-rec] {line.rstrip()}")
 
-            if stop_signalled:
-                # Send SIGTERM to the Node.js subprocess so it stops recording
-                # early and saves whatever it has
-                proc = current_proc_holder.get("proc")
-                if proc and proc.poll() is None:
-                    logger.info(f"[Recorder:{session_id}] Sending SIGTERM to chunk {chunk_index}")
-                    try:
-                        proc.send_signal(signal.SIGTERM)
-                    except Exception as e:
-                        logger.warning(f"[Recorder:{session_id}] SIGTERM failed: {e}")
+    drain_t = threading.Thread(target=_drain, daemon=True)
+    drain_t.start()
 
-                # Wait for the subprocess to finish (it will save the partial recording)
-                chunk_done.wait(timeout=60)
+    try:
+        proc.wait(timeout=timeout)
+        drain_t.join(timeout=5)
+        return proc.returncode == 0
+    except subprocess.TimeoutExpired:
+        logger.error(f"[Recorder] Subprocess did not exit in {timeout}s — killing")
+        proc.kill()
+        return False
 
-                if not chunk_result.get("ok"):
-                    logger.warning(
-                        f"[Recorder:{session_id}] Chunk {chunk_index} returned error after stop: "
-                        f"{chunk_result.get('error')} — checking if file exists anyway"
-                    )
-                    # Even if returncode != 0, the file may have been written
-                    if not os.path.exists(chunk_path) or os.path.getsize(chunk_path) == 0:
-                        raise RuntimeError(
-                            f"Chunk {chunk_index} failed and no output file: {chunk_result.get('error')}"
-                        )
-                    logger.info(f"[Recorder:{session_id}] Chunk {chunk_index} file exists despite error — using it")
 
-                sz = os.path.getsize(chunk_path) if os.path.exists(chunk_path) else 0
-                logger.info(f"[Recorder:{session_id}] Chunk {chunk_index} done ({sz} bytes)")
+# ── Relay WebSocket listener ──────────────────────────────────────────────────
+def _relay_ws_listener(rec: dict) -> None:
+    """
+    Connects to the relay WebSocket and listens for video_segment events.
+    When a video_segment fires, pauses the LiveKit capture and downloads
+    the video file. When video_segment_end fires, resumes LiveKit capture.
+    """
+    import json
+
+    relay_ws_url = RELAY_URL.replace("https://", "wss://").replace("http://", "ws://")
+    relay_ws_url = f"{relay_ws_url}/ws?role=recorder&session_id={rec['session_id']}"
+
+    logger.info(f"[WS] Connecting to relay: {relay_ws_url}")
+
+    def on_message(ws_app, message):
+        try:
+            msg = json.loads(message)
+        except Exception:
+            return
+
+        msg_type = msg.get("type", "")
+
+        if msg_type == "video_segment":
+            url = msg.get("url", "")
+            title = msg.get("title", "")
+            logger.info(f"[WS] video_segment: {title} — {url}")
+            if url:
+                rec["pending_video_segment"] = {"url": url, "title": title}
+                rec["in_video_segment"].set()
+
+        elif msg_type == "video_segment_end":
+            logger.info("[WS] video_segment_end")
+            rec["in_video_segment"].clear()
+            rec["video_segment_ended"].set()
+
+        elif msg_type == "session_stopped":
+            logger.info("[WS] session_stopped received")
+            rec["stop_event"].set()
+
+    def on_error(ws_app, error):
+        logger.warning(f"[WS] Error: {error}")
+
+    def on_close(ws_app, code, msg):
+        logger.info(f"[WS] Closed: {code} {msg}")
+
+    def on_open(ws_app):
+        logger.info("[WS] Connected to relay")
+
+    ws_app = websocket.WebSocketApp(
+        relay_ws_url,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close,
+        on_open=on_open,
+    )
+    rec["_ws"] = ws_app
+
+    # Run until stop_event is set
+    def _run():
+        while not rec["stop_event"].is_set():
+            try:
+                ws_app.run_forever(ping_interval=30, ping_timeout=10)
+            except Exception as e:
+                logger.warning(f"[WS] run_forever error: {e}")
+            if not rec["stop_event"].is_set():
+                time.sleep(3)  # reconnect delay
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
+# ── Main recording worker ─────────────────────────────────────────────────────
+def _recording_worker(rec: dict) -> None:
+    session_id  = rec["session_id"]
+    amplinar_id = rec["amplinar_id"]
+    room_name   = rec["room_name"]
+    stop_event  = rec["stop_event"]
+
+    if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET or not LIVEKIT_URL:
+        rec["status"] = "error"
+        rec["error"]  = "LIVEKIT_API_KEY / LIVEKIT_API_SECRET / LIVEKIT_URL not configured"
+        return
+
+    segment_files: list = []   # ordered list of (path, is_temp) tuples
+    rec["started_at"] = datetime.now(timezone.utc).isoformat()
+    rec["status"]     = "recording"
+
+    logger.info(f"[Recorder:{session_id}] Starting LiveKit capture for room={room_name}")
+
+    # Start relay WebSocket listener
+    _relay_ws_listener(rec)
+
+    # ── Segment loop ──────────────────────────────────────────────────────────
+    # We alternate between LiveKit capture segments and downloaded video segments.
+    # The loop runs until stop_event is set.
+
+    lk_proc = None
+    lk_out  = None
+
+    def _start_lk_segment():
+        nonlocal lk_proc, lk_out
+        tf = tempfile.NamedTemporaryFile(suffix="_lk.webm", delete=False)
+        tf.close()
+        lk_out = tf.name
+        token = _make_lk_token(room_name, identity=f"recorder-{session_id[:8]}")
+        lk_proc = _start_lk_subprocess(LIVEKIT_URL, token, lk_out)
+        logger.info(f"[Recorder:{session_id}] LiveKit segment started → {lk_out}")
+
+    def _stop_lk_segment():
+        nonlocal lk_proc, lk_out
+        if lk_proc is None:
+            return
+        ok = _stop_lk_subprocess(lk_proc)
+        sz = os.path.getsize(lk_out) if lk_out and os.path.exists(lk_out) else 0
+        logger.info(f"[Recorder:{session_id}] LiveKit segment done (ok={ok}, {sz} bytes) → {lk_out}")
+        if sz > 0:
+            segment_files.append(lk_out)
+        else:
+            try:
+                os.unlink(lk_out)
+            except Exception:
+                pass
+        lk_proc = None
+        lk_out  = None
+
+    try:
+        # Start first LiveKit segment
+        _start_lk_segment()
+
+        while not stop_event.is_set():
+            # Wait for either: stop_event OR a video_segment event
+            triggered = threading.Event()
+
+            def _wait():
+                # Wait for stop or video_segment
+                while not stop_event.is_set() and not rec["in_video_segment"].is_set():
+                    stop_event.wait(timeout=1)
+                    rec["in_video_segment"].wait(timeout=1)
+                triggered.set()
+
+            wait_t = threading.Thread(target=_wait, daemon=True)
+            wait_t.start()
+            triggered.wait()
+
+            if stop_event.is_set():
                 break
 
-            else:
-                # Overlap window: start next chunk, wait for this one to finish
-                chunk_index += 1
-                chunk_done.wait()
+            if rec["in_video_segment"].is_set():
+                # Stop the current LiveKit segment
+                logger.info(f"[Recorder:{session_id}] video_segment event — pausing LiveKit capture")
+                _stop_lk_segment()
 
-                if not chunk_result.get("ok"):
-                    raise RuntimeError(f"Chunk {chunk_index - 1} failed: {chunk_result.get('error')}")
+                # Download the video segment
+                seg_info = rec.get("pending_video_segment", {})
+                seg_url  = seg_info.get("url", "")
+                seg_title = seg_info.get("title", "")
 
-                sz = os.path.getsize(chunk_path)
-                logger.info(f"[Recorder:{session_id}] Chunk {chunk_index - 1} done ({sz} bytes)")
-                # Loop continues to start next chunk
+                if seg_url:
+                    try:
+                        logger.info(f"[Recorder:{session_id}] Downloading video segment: {seg_url}")
+                        resp = requests.get(seg_url, timeout=60, stream=True)
+                        resp.raise_for_status()
+                        tf = tempfile.NamedTemporaryFile(suffix="_video.mp4", delete=False)
+                        for chunk in resp.iter_content(chunk_size=65536):
+                            tf.write(chunk)
+                        tf.close()
+                        sz = os.path.getsize(tf.name)
+                        logger.info(f"[Recorder:{session_id}] Video segment downloaded ({sz} bytes) → {tf.name}")
+                        segment_files.append(tf.name)
+                    except Exception as e:
+                        logger.error(f"[Recorder:{session_id}] Failed to download video segment: {e}")
+
+                # Wait for video_segment_end or stop
+                logger.info(f"[Recorder:{session_id}] Waiting for video_segment_end...")
+                rec["video_segment_ended"].clear()
+                while not stop_event.is_set() and not rec["video_segment_ended"].is_set():
+                    rec["video_segment_ended"].wait(timeout=1)
+
+                if stop_event.is_set():
+                    break
+
+                # Resume LiveKit capture
+                logger.info(f"[Recorder:{session_id}] video_segment_end — resuming LiveKit capture")
+                rec["in_video_segment"].clear()
+                _start_lk_segment()
+
+        # Stop the final LiveKit segment
+        _stop_lk_segment()
 
         # ── Post-recording: concat + upload ───────────────────────────────────
-        # Filter out any zero-byte files
-        valid_chunks = [f for f in chunk_files if os.path.exists(f) and os.path.getsize(f) > 0]
-        if not valid_chunks:
-            raise RuntimeError("No valid chunk files to upload")
+        valid_segments = [f for f in segment_files if os.path.exists(f) and os.path.getsize(f) > 0]
+        if not valid_segments:
+            raise RuntimeError("No valid segment files to upload")
 
+        logger.info(f"[Recorder:{session_id}] Concatenating {len(valid_segments)} segment(s)")
         rec["status"] = "concatenating"
-        logger.info(f"[Recorder:{session_id}] Concatenating {len(valid_chunks)} chunk(s)")
-        final_bytes = _concat_chunks(valid_chunks)
+        final_bytes = _concat_segments(valid_segments)
 
         rec["status"] = "uploading"
         now    = datetime.now(timezone.utc)
@@ -311,10 +426,21 @@ def _recording_worker(rec: dict) -> None:
         logger.error(f"[Recorder:{session_id}] Failed: {e}")
         rec["status"] = "error"
         rec["error"]  = str(e)
+        # Make sure subprocess is killed
+        if lk_proc and lk_proc.poll() is None:
+            lk_proc.kill()
     finally:
-        for f in chunk_files:
+        # Clean up segment files
+        for f in segment_files:
             try:
                 os.unlink(f)
+            except Exception:
+                pass
+        # Close WebSocket
+        ws = rec.get("_ws")
+        if ws:
+            try:
+                ws.close()
             except Exception:
                 pass
 
@@ -322,7 +448,7 @@ def _recording_worker(rec: dict) -> None:
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "service": "amplinar-recorder", "mode": "puppeteer-chunked"})
+    return jsonify({"status": "ok", "service": "amplinar-recorder", "mode": "livekit-direct"})
 
 
 @app.route("/start", methods=["POST"])
@@ -331,12 +457,12 @@ def start_recording():
         return jsonify({"error": "Unauthorized"}), 401
 
     data        = request.get_json() or {}
-    viewer_url  = data.get("viewer_url")
     session_id  = data.get("session_id")
     amplinar_id = data.get("amplinar_id")
+    room_name   = data.get("room_name") or session_id  # room_name defaults to session_id
 
-    if not viewer_url or not session_id or not amplinar_id:
-        return jsonify({"error": "viewer_url, session_id, and amplinar_id are required"}), 400
+    if not session_id or not amplinar_id:
+        return jsonify({"error": "session_id and amplinar_id are required"}), 400
 
     with _recording_lock:
         global _recording
@@ -347,21 +473,24 @@ def start_recording():
             }), 409
 
         rec = {
-            "session_id":    session_id,
-            "amplinar_id":   amplinar_id,
-            "viewer_url":    viewer_url,
-            "status":        "starting",
-            "stop_event":    threading.Event(),
-            "_proc_holder":  {"proc": None},
-            "started_at":    None,
-            "completed_at":  None,
-            "recording_url": None,
-            "error":         None,
+            "session_id":         session_id,
+            "amplinar_id":        amplinar_id,
+            "room_name":          room_name,
+            "status":             "starting",
+            "stop_event":         threading.Event(),
+            "in_video_segment":   threading.Event(),
+            "video_segment_ended": threading.Event(),
+            "pending_video_segment": None,
+            "started_at":         None,
+            "completed_at":       None,
+            "recording_url":      None,
+            "error":              None,
+            "_ws":                None,
         }
         _recording = rec
 
     threading.Thread(target=_recording_worker, args=(rec,), daemon=True).start()
-    logger.info(f"[Recorder] Started session={session_id} amplinar={amplinar_id}")
+    logger.info(f"[Recorder] Started session={session_id} room={room_name} amplinar={amplinar_id}")
     return jsonify({"status": "started", "session_id": session_id})
 
 
@@ -389,15 +518,6 @@ def stop_recording():
 
     logger.info(f"[Recorder] Stop requested for {rec['session_id']}")
     rec["stop_event"].set()
-
-    # Also SIGTERM the subprocess immediately (belt-and-suspenders)
-    proc = rec.get("_proc_holder", {}).get("proc")
-    if proc and proc.poll() is None:
-        logger.info(f"[Recorder] Sending SIGTERM to subprocess from /stop route")
-        try:
-            proc.send_signal(signal.SIGTERM)
-        except Exception as e:
-            logger.warning(f"[Recorder] SIGTERM from route failed: {e}")
 
     return jsonify({"status": "stopping", "session_id": rec["session_id"]})
 

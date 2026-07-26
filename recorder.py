@@ -82,7 +82,7 @@ def upload_to_s3(local_path: str, s3_key: str) -> str:
         local_path,
         S3_BUCKET_NAME,
         s3_key,
-        ExtraArgs={"ContentType": "video/mp4", "ACL": "public-read"},
+        ExtraArgs={"ContentType": "video/mp4"},
     )
     url = f"https://{S3_BUCKET_NAME}.s3.{S3_REGION}.amazonaws.com/{s3_key}"
     logger.info(f"[S3] Upload complete: {url}")

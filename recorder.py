@@ -491,7 +491,8 @@ def _recording_worker(rec: dict) -> None:
 @app.route("/segment-complete", methods=["POST"])
 def segment_complete():
     """Called by livekit_recorder.js when a rolling segment is ready.
-    Uploads the merged segment WebM to S3 immediately.
+    livekit_recorder.js now uploads directly to S3 and passes the URL here.
+    We just store the URL and notify the relay.
     """
     if RECORDER_API_KEY and request.headers.get("X-Recorder-Key") != RECORDER_API_KEY:
         return jsonify({"error": "Unauthorized"}), 401
@@ -500,35 +501,53 @@ def segment_complete():
     session_id  = data.get("session_id", "unknown")
     amplinar_id = data.get("amplinar_id", "unknown")
     seg_idx     = data.get("segment_index", 0)
-    video_path  = data.get("video_path", "")
+    s3_url      = data.get("audio_path", "")  # livekit_recorder.js passes S3 URL as audio_path
 
-    if not video_path or not os.path.exists(video_path):
-        logger.warning(f"[Segment] Segment {seg_idx} path not found: {video_path}")
-        return jsonify({"error": "file not found"}), 404
+    if not s3_url:
+        # Fallback: try video_path field
+        s3_url = data.get("video_path", "")
 
-    sz = os.path.getsize(video_path)
-    logger.info(f"[Segment] Uploading segment {seg_idx} ({sz} bytes) for session {session_id}")
+    if s3_url and s3_url.startswith("https://"):
+        logger.info(f"[Segment] Segment {seg_idx} already in S3: {s3_url}")
+        # Notify relay of partial recording URL
+        _notify_relay(session_id, amplinar_id, s3_url)
+        # Store URL in active recording state
+        with _recording_lock:
+            rec = _recording
+        if rec and rec.get("session_id") == session_id:
+            if "segment_urls" not in rec:
+                rec["segment_urls"] = []
+            rec["segment_urls"].append(s3_url)
+        return jsonify({"status": "ok", "segment_index": seg_idx, "url": s3_url})
+    else:
+        # Legacy fallback: local file path — try to upload it
+        video_path = data.get("video_path", "")
+        if not video_path or not os.path.exists(video_path):
+            logger.warning(f"[Segment] Segment {seg_idx}: no S3 URL and no local file found")
+            return jsonify({"error": "no url or file"}), 404
 
-    def _upload():
-        try:
-            with open(video_path, "rb") as f:
-                data_bytes = f.read()
-            now    = datetime.now(timezone.utc)
-            s3_key = f"amplinar-recordings/{amplinar_id}/{now.strftime('%Y%m%d_%H%M%S')}_seg{seg_idx:03d}_{session_id}.webm"
-            url    = upload_to_s3(data_bytes, s3_key)
-            logger.info(f"[Segment] Segment {seg_idx} uploaded: {url}")
-            # Notify relay of partial recording
-            _notify_relay(session_id, amplinar_id, url)
-        except Exception as e:
-            logger.error(f"[Segment] Upload failed for segment {seg_idx}: {e}")
-        finally:
+        sz = os.path.getsize(video_path)
+        logger.info(f"[Segment] Uploading segment {seg_idx} locally ({sz} bytes) for session {session_id}")
+
+        def _upload():
             try:
-                os.unlink(video_path)
-            except Exception:
-                pass
+                with open(video_path, "rb") as f:
+                    data_bytes = f.read()
+                now    = datetime.now(timezone.utc)
+                s3_key = f"amplinar-recordings/{amplinar_id}/{now.strftime('%Y%m%d_%H%M%S')}_seg{seg_idx:03d}_{session_id}.webm"
+                url    = upload_to_s3(data_bytes, s3_key)
+                logger.info(f"[Segment] Segment {seg_idx} uploaded: {url}")
+                _notify_relay(session_id, amplinar_id, url)
+            except Exception as e:
+                logger.error(f"[Segment] Upload failed for segment {seg_idx}: {e}")
+            finally:
+                try:
+                    os.unlink(video_path)
+                except Exception:
+                    pass
 
-    threading.Thread(target=_upload, daemon=True).start()
-    return jsonify({"status": "uploading", "segment_index": seg_idx})
+        threading.Thread(target=_upload, daemon=True).start()
+        return jsonify({"status": "uploading", "segment_index": seg_idx})
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────

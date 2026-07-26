@@ -123,6 +123,26 @@ def _recording_worker(rec: dict) -> None:
         rec["xvfb_proc"] = xvfb_proc
         time.sleep(1.5)  # Give Xvfb time to start
 
+        # 1b. Start PulseAudio virtual audio sink (needed for FFmpeg audio capture)
+        try:
+            subprocess.run(
+                ["pulseaudio", "--start", "--daemonize=yes", "--exit-idle-time=-1"],
+                env=env, check=True, capture_output=True, timeout=10
+            )
+            time.sleep(1)  # Give PulseAudio time to start
+            # Load a null sink so FFmpeg always has an audio source
+            subprocess.run(
+                ["pactl", "load-module", "module-null-sink", "sink_name=virtual"],
+                env=env, capture_output=True, timeout=5
+            )
+            subprocess.run(
+                ["pactl", "set-default-source", "virtual.monitor"],
+                env=env, capture_output=True, timeout=5
+            )
+            logger.info(f"[Recorder:{session_id}] PulseAudio started with virtual sink")
+        except Exception as pa_err:
+            logger.warning(f"[Recorder:{session_id}] PulseAudio start failed (will use silent audio): {pa_err}")
+
         # 2. Start Chromium (headless=false so it renders to the virtual display)
         logger.info(f"[Recorder:{session_id}] Starting Chromium → {viewer_url}")
         chromium_proc = subprocess.Popen(
@@ -157,7 +177,7 @@ def _recording_worker(rec: dict) -> None:
                 "-s", f"{DISPLAY_WIDTH}x{DISPLAY_HEIGHT}",
                 "-i", display,
                 "-f", "pulse",
-                "-i", "default",
+                "-i", "virtual.monitor",
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
                 "-crf", "23",

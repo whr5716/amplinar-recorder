@@ -82,7 +82,7 @@ def upload_to_s3(local_path: str, s3_key: str) -> str:
         local_path,
         S3_BUCKET_NAME,
         s3_key,
-        ExtraArgs={"ContentType": "video/mp4"},
+        ExtraArgs={"ContentType": "video/mp4", "ACL": "public-read"},
     )
     url = f"https://{S3_BUCKET_NAME}.s3.{S3_REGION}.amazonaws.com/{s3_key}"
     logger.info(f"[S3] Upload complete: {url}")
@@ -124,20 +124,21 @@ def _recording_worker(rec: dict) -> None:
         time.sleep(1.5)  # Give Xvfb time to start
 
         # 1b. Start PulseAudio in --system mode (works in headless Docker as root)
+        pa_ok = False
         try:
             # Clean up any stale PulseAudio state from previous runs
             subprocess.run(["rm", "-rf", "/var/run/pulse", "/var/lib/pulse", "/root/.config/pulse/cookie"],
                            capture_output=True)
-            # Start PulseAudio in system mode (no D-Bus user session required)
+            # Start PulseAudio WITHOUT -D so we can track the process
             pa_proc = subprocess.Popen(
-                ["pulseaudio", "-D", "--verbose", "--exit-idle-time=-1", "--system", "--disallow-exit"],
+                ["pulseaudio", "--verbose", "--exit-idle-time=-1", "--system", "--disallow-exit"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
             time.sleep(2)  # Give PulseAudio time to start
             if pa_proc.poll() is not None:
-                pa_err = pa_proc.stderr.read().decode(errors='replace')
-                raise RuntimeError(f"PulseAudio exited: {pa_err[-300:]}")
+                pa_err_out = pa_proc.stderr.read().decode(errors='replace')
+                raise RuntimeError(f"PulseAudio exited immediately: {pa_err_out[-300:]}")
             rec["pa_proc"] = pa_proc
             # Load null sink so Chromium audio routes through PulseAudio
             env["PULSE_SERVER"] = "unix:/var/run/pulse/native"
@@ -152,6 +153,9 @@ def _recording_worker(rec: dict) -> None:
                 for r, name in [(r1,'null-sink'),(r2,'default-sink'),(r3,'default-src')]:
                     if r.returncode != 0:
                         logger.warning(f"[Recorder:{session_id}] pactl {name}: {r.stderr.decode(errors='replace').strip()}")
+                raise RuntimeError("pactl setup failed — see warnings above")
+            pa_ok = True
+            logger.info(f"[Recorder:{session_id}] PulseAudio audio capture ready")
         except Exception as pa_err:
             logger.warning(f"[Recorder:{session_id}] PulseAudio failed ({pa_err}) — falling back to silent audio")
             env.pop("PULSE_SERVER", None)
@@ -180,7 +184,8 @@ def _recording_worker(rec: dict) -> None:
         time.sleep(3)  # Give Chromium time to load the page
 
         # 3. Start FFmpeg capturing the virtual display
-        logger.info(f"[Recorder:{session_id}] Starting FFmpeg capture → {output_path}")
+        logger.info(f"[Recorder:{session_id}] Starting FFmpeg capture → {output_path} (audio={'pulse' if pa_ok else 'silent'})")
+        audio_args = ["-f", "pulse", "-i", "loopback.monitor"] if pa_ok else ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
         ffmpeg_proc = subprocess.Popen(
             [
                 "ffmpeg",
@@ -189,8 +194,7 @@ def _recording_worker(rec: dict) -> None:
                 "-r", "30",
                 "-s", f"{DISPLAY_WIDTH}x{DISPLAY_HEIGHT}",
                 "-i", display,
-                "-f", "pulse",
-                "-i", "loopback.monitor",
+                *audio_args,
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
                 "-crf", "23",

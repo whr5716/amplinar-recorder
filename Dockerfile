@@ -46,11 +46,18 @@ RUN sed -i 's/^load-module module-console-kit/# load-module module-console-kit/'
 RUN mkdir -p /var/run/dbus && \
     dbus-uuidgen > /var/lib/dbus/machine-id 2>/dev/null || true
 
-# 4. PulseAudio client config — use system mode socket
+# 4. PulseAudio client config — point to system mode socket
+# Do NOT set autospawn=no or daemon-binary=/bin/true — those break pactl
 RUN mkdir -p /root/.config/pulse && \
-    echo 'autospawn = no' > /root/.config/pulse/client.conf && \
-    echo 'daemon-binary = /bin/true' >> /root/.config/pulse/client.conf
+    echo 'default-server = unix:/var/run/pulse/native' > /root/.config/pulse/client.conf
+
+# 5. Create entrypoint that starts D-Bus then the app
+RUN echo '#!/bin/bash\n\
+mkdir -p /var/run/dbus\n\
+dbus-daemon --system --fork 2>/dev/null || true\n\
+exec gunicorn --bind 0.0.0.0:8080 --workers 1 --threads 4 --timeout 120 recorder:app' > /entrypoint.sh && \
+    chmod +x /entrypoint.sh
 
 EXPOSE 8080
 
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "4", "--timeout", "120", "recorder:app"]
+CMD ["/entrypoint.sh"]

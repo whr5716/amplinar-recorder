@@ -171,7 +171,10 @@ def _concat_segments(segment_paths: list) -> bytes:
 
 # ── LiveKit recorder subprocess ───────────────────────────────────────────────
 def _start_lk_subprocess(lk_url: str, lk_token: str, output_path: str) -> subprocess.Popen:
-    """Spawn livekit_recorder.js and return the Popen object."""
+    """Spawn livekit_recorder.js and return the Popen object.
+    Starts a background thread that streams stdout live so logs appear
+    in Railway in real time rather than only after SIGTERM.
+    """
     env = os.environ.copy()
     proc = subprocess.Popen(
         ["node", LK_RECORDER_JS, lk_url, lk_token, output_path],
@@ -179,8 +182,23 @@ def _start_lk_subprocess(lk_url: str, lk_token: str, output_path: str) -> subpro
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        bufsize=1,  # line-buffered
     )
     logger.info(f"[Recorder] livekit_recorder.js started (pid={proc.pid})")
+
+    # Stream stdout live in a background thread so logs appear immediately
+    def _live_stream():
+        try:
+            for line in proc.stdout:
+                logger.info(f"[lk-rec] {line.rstrip()}")
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_live_stream, daemon=True)
+    t.start()
+    # Store thread on proc so _stop_lk_subprocess can join it
+    proc._stdout_thread = t
+
     return proc
 
 
@@ -194,17 +212,12 @@ def _stop_lk_subprocess(proc: subprocess.Popen, timeout: int = 120) -> bool:
     except Exception as e:
         logger.warning(f"[Recorder] SIGTERM failed: {e}")
 
-    # Drain stdout while waiting
-    def _drain():
-        for line in proc.stdout:
-            logger.info(f"[lk-rec] {line.rstrip()}")
-
-    drain_t = threading.Thread(target=_drain, daemon=True)
-    drain_t.start()
-
     try:
         proc.wait(timeout=timeout)
-        drain_t.join(timeout=5)
+        # Join the live-stream thread so all output is flushed before we return
+        t = getattr(proc, '_stdout_thread', None)
+        if t:
+            t.join(timeout=10)
         return proc.returncode == 0
     except subprocess.TimeoutExpired:
         logger.error(f"[Recorder] Subprocess did not exit in {timeout}s — killing")

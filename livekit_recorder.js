@@ -35,11 +35,40 @@ const {
 } = require('@livekit/rtc-node');
 
 const { AccessToken } = require('livekit-server-sdk');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { spawn, spawnSync } = require('child_process');
 const fs   = require('fs');
 const http = require('http');
 const https = require('https');
 const path = require('path');
+
+// ── S3 client ─────────────────────────────────────────────────────────────────
+const S3_BUCKET = process.env.S3_BUCKET_NAME || 'wholesalehotelrates-images';
+const S3_REGION = process.env.S3_REGION      || 'us-east-1';
+const s3Client  = new S3Client({
+  region: S3_REGION,
+  credentials: {
+    accessKeyId:     process.env.S3_ACCESS_KEY_ID,
+    secretAccessKey: process.env.S3_SECRET_ACCESS_KEY,
+  },
+});
+
+async function uploadToS3(filePath, segIdx) {
+  const now    = new Date();
+  const ts     = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const s3Key  = `amplinar-recordings/${AMPLINAR_ID}/${ts}_${SESSION_ID}_seg${String(segIdx).padStart(3,'0')}.webm`;
+  const body   = fs.readFileSync(filePath);
+  const cmd    = new PutObjectCommand({
+    Bucket:      S3_BUCKET,
+    Key:         s3Key,
+    Body:        body,
+    ContentType: 'video/webm',
+  });
+  await s3Client.send(cmd);
+  const url = `https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com/${s3Key}`;
+  console.log(`[lk-rec] Segment ${segIdx} uploaded to S3: ${url}`);
+  return url;
+}
 
 // ── Parse args ────────────────────────────────────────────────────────────────
 const positional = [];
@@ -277,7 +306,19 @@ function mergeSegment(vOut, aOut, mergedOut, idx) {
   console.log(`[lk-rec] Segment ${idx} merged: ${mergedOut} (${sz} bytes)`);
 
   if (sz > 0) {
-    notifySegmentComplete(mergedOut, '', idx);
+    // Upload directly to S3 from Node.js — does NOT depend on recorder.py being alive
+    uploadToS3(mergedOut, idx)
+      .then(url => {
+        // Also notify recorder.py so it can store the URL in the DB
+        notifySegmentComplete(mergedOut, url, idx);
+        // Clean up local file after successful upload
+        try { fs.unlinkSync(mergedOut); } catch (_) {}
+      })
+      .catch(e => {
+        console.error(`[lk-rec] S3 upload failed for seg${idx}: ${e.message}`);
+        // Still notify recorder.py with local path as fallback
+        notifySegmentComplete(mergedOut, '', idx);
+      });
   }
 }
 

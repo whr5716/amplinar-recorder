@@ -124,21 +124,25 @@ def _recording_worker(rec: dict) -> None:
         time.sleep(1.5)  # Give Xvfb time to start
 
         # 1b. Start PulseAudio virtual audio sink (needed for FFmpeg audio capture)
-        pulse_socket = "/tmp/pulse-socket"
+        pulse_socket = "/tmp/pulse-native"
         env["PULSE_SERVER"] = f"unix:{pulse_socket}"
         try:
-            # Start PulseAudio with a unix socket so all child processes can find it
+            # Start PulseAudio daemon
             subprocess.run(
-                [
-                    "pulseaudio",
-                    "--start",
-                    "--daemonize=yes",
-                    "--exit-idle-time=-1",
-                    f"--load=module-native-protocol-unix auth-anonymous=1 socket={pulse_socket}",
-                ],
+                ["pulseaudio", "--start", "--daemonize=yes", "--exit-idle-time=-1"],
                 env=env, check=True, capture_output=True, timeout=10
             )
-            time.sleep(2)  # Give PulseAudio time to start and bind socket
+            time.sleep(2)  # Give PulseAudio time to start
+            # Find the actual PulseAudio socket path
+            import glob as _glob
+            sockets = _glob.glob("/run/user/*/pulse/native") + _glob.glob("/tmp/pulse-*/native")
+            if sockets:
+                env["PULSE_SERVER"] = f"unix:{sockets[0]}"
+                logger.info(f"[Recorder:{session_id}] PulseAudio socket: {sockets[0]}")
+            else:
+                # Fall back to default (no explicit socket)
+                env.pop("PULSE_SERVER", None)
+                logger.info(f"[Recorder:{session_id}] PulseAudio socket not found, using default")
             # Load a null sink so FFmpeg always has an audio source
             r1 = subprocess.run(
                 ["pactl", "load-module", "module-null-sink", "sink_name=virtual"],
@@ -148,7 +152,11 @@ def _recording_worker(rec: dict) -> None:
                 ["pactl", "set-default-source", "virtual.monitor"],
                 env=env, capture_output=True, timeout=5
             )
-            logger.info(f"[Recorder:{session_id}] PulseAudio started (null-sink={r1.returncode}, default-src={r2.returncode})")
+            logger.info(f"[Recorder:{session_id}] PulseAudio ready (null-sink={r1.returncode}, default-src={r2.returncode})")
+            if r1.returncode != 0:
+                logger.warning(f"[Recorder:{session_id}] pactl null-sink stderr: {r1.stderr.decode(errors='replace')}")
+            if r2.returncode != 0:
+                logger.warning(f"[Recorder:{session_id}] pactl default-src stderr: {r2.stderr.decode(errors='replace')}")
         except Exception as pa_err:
             logger.warning(f"[Recorder:{session_id}] PulseAudio start failed: {pa_err}")
 

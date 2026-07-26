@@ -103,7 +103,7 @@ def upload_to_s3(data: bytes, s3_key: str) -> str:
         region_name=S3_REGION,
     )
     logger.info(f"[S3] Uploading {len(data)} bytes → {s3_key}")
-    s3.put_object(Bucket=S3_BUCKET_NAME, Key=s3_key, Body=data, ContentType="video/webm")
+    s3.put_object(Bucket=S3_BUCKET_NAME, Key=s3_key, Body=data, ContentType="video/mp4")
     url = f"https://{S3_BUCKET_NAME}.s3.{S3_REGION}.amazonaws.com/{s3_key}"
     logger.info(f"[S3] Done: {url}")
     return url
@@ -142,7 +142,7 @@ def _concat_segments(segment_paths: list) -> bytes:
             listf.write(f"file '{p}'\n")
         list_path = listf.name
 
-    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as outf:
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as outf:
         out_path = outf.name
 
     try:
@@ -186,13 +186,14 @@ def _start_lk_subprocess(lk_url: str, room_name: str, output_path: str,
         [
             "node", LK_RECORDER_JS,
             lk_url, room_name, output_path,
-            f"--segment-minutes={SEGMENT_MINUTES}",
+            "--segment-minutes=0",  # no timer rolling — we roll on content boundaries
             f"--callback-url={callback_url}",
             f"--callback-key={RECORDER_API_KEY}",
             f"--session-id={session_id}",
             f"--amplinar-id={amplinar_id}",
         ],
         env=env,
+        stdin=subprocess.PIPE,   # so we can send ROLL_SEGMENT commands
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -239,6 +240,19 @@ def _stop_lk_subprocess(proc: subprocess.Popen, timeout: int = 120) -> bool:
         return False
 
 
+# ── Send command to livekit_recorder.js via stdin ────────────────────────────
+def _send_lk_command(rec: dict, cmd: str) -> None:
+    """Write a newline-terminated command to livekit_recorder.js stdin."""
+    proc = rec.get("lk_proc")
+    if proc and proc.poll() is None:
+        try:
+            proc.stdin.write(cmd + "\n")
+            proc.stdin.flush()
+            logger.info(f"[Recorder] Sent command to lk-rec: {cmd}")
+        except Exception as e:
+            logger.warning(f"[Recorder] Failed to send command '{cmd}': {e}")
+
+
 # ── Relay WebSocket listener ──────────────────────────────────────────────────
 def _relay_ws_listener(rec: dict) -> None:
     """
@@ -267,6 +281,8 @@ def _relay_ws_listener(rec: dict) -> None:
             logger.info(f"[WS] video_segment: {title} — {url}")
             if url:
                 rec["pending_video_segment"] = {"url": url, "title": title}
+                # Tell livekit_recorder.js to roll the current segment before we pause
+                _send_lk_command(rec, "ROLL_SEGMENT")
                 rec["in_video_segment"].set()
 
         elif msg_type == "video_segment_end":
@@ -340,7 +356,7 @@ def _recording_worker(rec: dict) -> None:
 
     def _start_lk_segment():
         nonlocal lk_proc, lk_out
-        tf = tempfile.NamedTemporaryFile(suffix="_lk.webm", delete=False)
+        tf = tempfile.NamedTemporaryFile(suffix="_lk.mp4", delete=False)
         tf.close()
         lk_out = tf.name
         lk_proc = _start_lk_subprocess(
@@ -356,9 +372,9 @@ def _recording_worker(rec: dict) -> None:
         ok = _stop_lk_subprocess(lk_proc)
         # livekit_recorder.js writes rolling segments as <base>_seg000.webm, _seg001.webm etc.
         # The placeholder lk_out itself stays at 0 bytes — collect the actual segment files.
-        base = lk_out.replace('.webm', '') if lk_out else ''
+        base = lk_out.replace('.mp4', '') if lk_out else ''
         import glob as _glob
-        seg_files = sorted(_glob.glob(f"{base}_seg*.webm")) if base else []
+        seg_files = sorted(_glob.glob(f"{base}_seg*.mp4")) if base else []
         if seg_files:
             for sf in seg_files:
                 sz = os.path.getsize(sf)

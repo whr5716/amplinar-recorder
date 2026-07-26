@@ -1,10 +1,10 @@
 'use strict';
 
 /**
- * livekit_recorder.js  (v5 — rolling segments, crash-safe)
+ * livekit_recorder.js  (v6 — MP4 output, rolling segments, crash-safe)
  * =========================================================
  * Connects to a LiveKit room, captures avatar video + audio, and writes
- * rolling WebM segments.  Each segment is:
+ * rolling MP4 segments (H.264/AAC).  Each segment is:
  *   1. Written via a streaming FFmpeg pipeline (crash-safe — partial file
  *      is always a valid WebM)
  *   2. Uploaded to S3 immediately on completion via a callback to recorder.py
@@ -56,13 +56,13 @@ const s3Client  = new S3Client({
 async function uploadToS3(filePath, segIdx) {
   const now    = new Date();
   const ts     = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const s3Key  = `amplinar-recordings/${AMPLINAR_ID}/${ts}_${SESSION_ID}_seg${String(segIdx).padStart(3,'0')}.webm`;
+  const s3Key  = `amplinar-recordings/${AMPLINAR_ID}/${ts}_${SESSION_ID}_seg${String(segIdx).padStart(3,'0')}.mp4`;
   const body   = fs.readFileSync(filePath);
   const cmd    = new PutObjectCommand({
     Bucket:      S3_BUCKET,
     Key:         s3Key,
     Body:        body,
-    ContentType: 'video/webm',
+    ContentType: 'video/mp4',
   });
   await s3Client.send(cmd);
   const url = `https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com/${s3Key}`;
@@ -174,29 +174,31 @@ function segmentPath(idx, suffix) {
 }
 
 function startFFmpegSegment(idx, width, height) {
-  const vOut = segmentPath(idx, '_video.webm');
-  const aOut = segmentPath(idx, '_audio.webm');
+  const vOut = segmentPath(idx, '_video.mp4');
+  const aOut = segmentPath(idx, '_audio.aac');
 
   console.log(`[lk-rec] Starting FFmpeg segment ${idx}: ${vOut}`);
 
+  // H.264 video — ultrafast preset for real-time encoding
   const vProc = spawn('ffmpeg', [
     '-y',
     '-f', 'rawvideo', '-pix_fmt', 'yuv420p',
     '-s', `${width}x${height}`,
     '-r', String(VIDEO_FPS),
     '-i', 'pipe:0',
-    '-c:v', 'libvpx', '-b:v', '1500k',
-    '-deadline', 'realtime', '-cpu-used', '8',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+    '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
     '-an', vOut,
   ], { stdio: ['pipe', 'inherit', 'inherit'] });
 
   vProc.on('exit', (code) => console.log(`[lk-rec] FFmpeg video seg${idx} exited (code=${code})`));
 
+  // AAC audio
   const aProc = spawn('ffmpeg', [
     '-y',
     '-f', 's16le', '-ar', String(AUDIO_SAMPLE_RATE), '-ac', String(AUDIO_CHANNELS),
     '-i', 'pipe:0',
-    '-c:a', 'libopus', '-b:a', '128k',
+    '-c:a', 'aac', '-b:a', '128k',
     aOut,
   ], { stdio: ['pipe', 'inherit', 'inherit'] });
 
@@ -279,9 +281,11 @@ function mergeSegment(vOut, aOut, mergedOut, idx) {
 
   let args;
   if (vExists && aExists) {
-    args = ['-y', '-i', vOut, '-i', aOut, '-c:v', 'copy', '-c:a', 'copy', mergedOut];
+    // Mux H.264 video + AAC audio into MP4
+    args = ['-y', '-i', vOut, '-i', aOut, '-c:v', 'copy', '-c:a', 'copy',
+            '-movflags', '+faststart', mergedOut];
   } else if (vExists) {
-    args = ['-y', '-i', vOut, '-c', 'copy', mergedOut];
+    args = ['-y', '-i', vOut, '-c', 'copy', '-movflags', '+faststart', mergedOut];
   } else if (aExists) {
     args = ['-y', '-i', aOut, '-c', 'copy', mergedOut];
   } else {
@@ -367,10 +371,6 @@ function startVideoCapture(track) {
             videoFrameCount++;
             if (videoFrameCount % 300 === 0) {
               console.log(`[lk-rec] Video frames: ${videoFrameCount} (${actualWidth}x${actualHeight})`);
-              // Roll segment if time limit reached
-              if (SEGMENT_MS > 0 && !segmentRolling && (Date.now() - segmentStartMs) >= SEGMENT_MS) {
-                rollSegment();  // async, non-blocking
-              }
             }
           }
         } catch (e) {
@@ -447,7 +447,7 @@ async function gracefulStop() {
   }
 
   // Merge and notify the final segment
-  const finalMerged = segmentPath(segmentIndex, '.webm');
+  const finalMerged = segmentPath(segmentIndex, '.mp4');
   mergeSegment(currentVideoOut, currentAudioOut, finalMerged, segmentIndex);
 
   process.exit(0);
@@ -505,6 +505,27 @@ async function main() {
       }
     }
   }
+
+  // Listen on stdin for commands from recorder.py
+  // Commands: ROLL_SEGMENT\n
+  process.stdin.setEncoding('utf8');
+  let stdinBuf = '';
+  process.stdin.on('data', (chunk) => {
+    stdinBuf += chunk;
+    let nl;
+    while ((nl = stdinBuf.indexOf('\n')) !== -1) {
+      const cmd = stdinBuf.slice(0, nl).trim();
+      stdinBuf = stdinBuf.slice(nl + 1);
+      if (cmd === 'ROLL_SEGMENT') {
+        console.log('[lk-rec] Received ROLL_SEGMENT command — rolling segment');
+        rollSegment();
+      } else if (cmd === 'STOP') {
+        console.log('[lk-rec] Received STOP command');
+        gracefulStop();
+      }
+    }
+  });
+  process.stdin.resume();
 
   // Wait for stop signal
   await new Promise(resolve => {

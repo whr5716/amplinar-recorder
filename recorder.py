@@ -127,7 +127,7 @@ def _recording_worker(rec: dict) -> None:
         logger.info(f"[Recorder:{session_id}] Starting Chromium → {viewer_url}")
         chromium_proc = subprocess.Popen(
             [
-                "chromium-browser",
+                "chromium",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",

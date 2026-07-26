@@ -4,14 +4,15 @@ Amplinar Recorder Service
 Records a live Amplinar session using overlapping Browserless chunks stitched
 together with FFmpeg — no audible gaps.
 
+Each chunk is recorded by a Node.js subprocess (record_chunk.js) using
+Puppeteer, which avoids the Playwright CDP duplicate-target issue.
+
 Strategy
 --------
-- Each chunk runs for CHUNK_DURATION seconds (default 810s = 13.5 min, well
-  under the 15-min Browserless plan limit).
-- OVERLAP seconds (default 20) before a chunk ends, the next chunk starts so
-  both are recording simultaneously.
-- When concatenating, the first OVERLAP seconds of every chunk after the first
-  are trimmed, giving a seamless join.
+- CHUNK_DURATION seconds per chunk (default 810s = 13.5 min, under 15-min limit)
+- OVERLAP seconds before a chunk ends, the next chunk starts (default 20s)
+- First OVERLAP seconds of each chunk after the first are trimmed by record_chunk.js
+- FFmpeg concat demuxer joins all chunks seamlessly
 
 API
 ---
@@ -19,19 +20,9 @@ API
   POST /stop    { "session_id": "..." }
   GET  /status
   GET  /health
-
-Environment variables
----------------------
-  BROWSERLESS_API_KEY    Browserless token
-  RECORDER_API_KEY       Shared secret — relay must send X-Recorder-Key header
-  S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY / S3_BUCKET_NAME / S3_REGION
-  RELAY_URL / RELAY_API_KEY
-  CHUNK_DURATION         Seconds per chunk (default 810)
-  OVERLAP                Overlap seconds between chunks (default 20)
 """
 from __future__ import annotations
 
-import base64
 import logging
 import os
 import subprocess
@@ -43,7 +34,6 @@ from typing import Optional
 import boto3
 import requests
 from flask import Flask, jsonify, request
-from playwright.sync_api import sync_playwright
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("amplinar-recorder")
@@ -59,8 +49,10 @@ S3_BUCKET_NAME       = os.environ.get("S3_BUCKET_NAME", "wholesalehotelrates-ima
 S3_REGION            = os.environ.get("S3_REGION", "us-east-1")
 RELAY_URL            = os.environ.get("RELAY_URL", "")
 RELAY_API_KEY        = os.environ.get("RELAY_API_KEY", "")
-CHUNK_DURATION       = int(os.environ.get("CHUNK_DURATION", "810"))   # 13.5 min
-OVERLAP              = int(os.environ.get("OVERLAP", "20"))            # 20 sec overlap
+CHUNK_DURATION       = int(os.environ.get("CHUNK_DURATION", "810"))   # seconds
+OVERLAP              = int(os.environ.get("OVERLAP", "20"))            # seconds
+
+CHUNK_JS = os.path.join(os.path.dirname(__file__), "record_chunk.js")
 
 # ── State ─────────────────────────────────────────────────────────────────────
 _recording: Optional[dict] = None
@@ -74,75 +66,43 @@ def check_auth() -> bool:
     return request.headers.get("X-Recorder-Key") == RECORDER_API_KEY
 
 
-# ── Browserless chunk recorder ────────────────────────────────────────────────
-def _record_chunk(viewer_url: str, duration_secs: int, trim_start: float = 0.0) -> bytes:
+# ── Record one chunk via Node.js subprocess ───────────────────────────────────
+def _record_chunk_subprocess(
+    viewer_url: str,
+    duration_secs: int,
+    trim_secs: int,
+    output_path: str,
+) -> None:
     """
-    Connect to Browserless, navigate to viewer_url, record for duration_secs,
-    return the raw WebM bytes (already trimmed if trim_start > 0).
+    Calls record_chunk.js as a subprocess.
+    Raises RuntimeError on failure.
     """
-    ws_endpoint = (
-        f"wss://production-sfo.browserless.io"
-        f"?token={BROWSERLESS_API_KEY}"
-        f"&headless=false"
-        f"&stealth"
-        f"&record=true"
-        f"&timeout=900000"
+    env = os.environ.copy()
+    env["BROWSERLESS_API_KEY"] = BROWSERLESS_API_KEY
+
+    result = subprocess.run(
+        [
+            "node",
+            CHUNK_JS,
+            viewer_url,
+            str(duration_secs * 1000),   # ms
+            str(trim_secs * 1000),        # ms
+            output_path,
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=duration_secs + 120,     # generous timeout
     )
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.connect_over_cdp(ws_endpoint)
-        context = browser.contexts[0]
-        page    = context.pages[0]
-
-        page.set_viewport_size({"width": 1280, "height": 720})
-        page.goto(viewer_url, wait_until="domcontentloaded", timeout=30000)
-
-        cdp = context.new_cdp_session(page)
-        cdp.send("Browserless.startRecording")
-
-        # Wait for the chunk duration
-        page.wait_for_timeout(duration_secs * 1000)
-
-        response  = cdp.send("Browserless.stopRecording", {"encoding": "base64"})
-        raw_bytes = base64.b64decode(response["value"])
-        browser.close()
-
-    if not raw_bytes:
-        raise RuntimeError("Browserless returned empty recording")
-
-    if trim_start <= 0:
-        return raw_bytes
-
-    # Trim the first trim_start seconds using FFmpeg
-    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as inf:
-        inf.write(raw_bytes)
-        in_path = inf.name
-
-    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as outf:
-        out_path = outf.name
-
-    try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-ss", str(trim_start),
-                "-i", in_path,
-                "-c", "copy",
-                out_path,
-            ],
-            check=True,
-            capture_output=True,
-        )
-        with open(out_path, "rb") as f:
-            return f.read()
-    finally:
-        os.unlink(in_path)
-        os.unlink(out_path)
+    logger.info(f"[chunk stdout] {result.stdout.strip()}")
+    if result.returncode != 0:
+        logger.error(f"[chunk stderr] {result.stderr.strip()}")
+        raise RuntimeError(f"record_chunk.js exited {result.returncode}: {result.stderr.strip()[-300:]}")
 
 
 # ── FFmpeg concat ─────────────────────────────────────────────────────────────
-def _concat_chunks(chunk_paths: list[str]) -> bytes:
-    """Concatenate WebM chunk files into a single WebM using FFmpeg concat demuxer."""
+def _concat_chunks(chunk_paths: list) -> bytes:
     if len(chunk_paths) == 1:
         with open(chunk_paths[0], "rb") as f:
             return f.read()
@@ -157,14 +117,7 @@ def _concat_chunks(chunk_paths: list[str]) -> bytes:
 
     try:
         subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", list_path,
-                "-c", "copy",
-                out_path,
-            ],
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", out_path],
             check=True,
             capture_output=True,
         )
@@ -176,24 +129,23 @@ def _concat_chunks(chunk_paths: list[str]) -> bytes:
 
 
 # ── S3 upload ─────────────────────────────────────────────────────────────────
-def upload_to_s3(data: bytes, s3_key: str, content_type: str = "video/webm") -> str:
+def upload_to_s3(data: bytes, s3_key: str) -> str:
     s3 = boto3.client(
         "s3",
         aws_access_key_id=S3_ACCESS_KEY_ID,
         aws_secret_access_key=S3_SECRET_ACCESS_KEY,
         region_name=S3_REGION,
     )
-    logger.info(f"[S3] Uploading {len(data)} bytes → s3://{S3_BUCKET_NAME}/{s3_key}")
-    s3.put_object(Bucket=S3_BUCKET_NAME, Key=s3_key, Body=data, ContentType=content_type)
+    logger.info(f"[S3] Uploading {len(data)} bytes → {s3_key}")
+    s3.put_object(Bucket=S3_BUCKET_NAME, Key=s3_key, Body=data, ContentType="video/webm")
     url = f"https://{S3_BUCKET_NAME}.s3.{S3_REGION}.amazonaws.com/{s3_key}"
-    logger.info(f"[S3] Upload complete: {url}")
+    logger.info(f"[S3] Done: {url}")
     return url
 
 
 # ── Relay notification ────────────────────────────────────────────────────────
 def _notify_relay(session_id: str, amplinar_id: str, recording_url: str) -> None:
     if not RELAY_URL:
-        logger.warning("[Recorder] RELAY_URL not set — skipping relay notification")
         return
     try:
         resp = requests.post(
@@ -216,9 +168,8 @@ def _notify_relay(session_id: str, amplinar_id: str, recording_url: str) -> None
 def _recording_worker(rec: dict) -> None:
     """
     Orchestrates overlapping chunks:
-      chunk 0: records for CHUNK_DURATION seconds (no trim)
-      chunk N: starts OVERLAP seconds before chunk N-1 ends, trimmed by OVERLAP
-    Chunks are concatenated and uploaded when stop is signalled.
+      - Chunk 0: records for CHUNK_DURATION seconds, no trim
+      - Chunk N: starts OVERLAP seconds before chunk N-1 ends, trimmed by OVERLAP
     """
     session_id  = rec["session_id"]
     amplinar_id = rec["amplinar_id"]
@@ -230,91 +181,82 @@ def _recording_worker(rec: dict) -> None:
         rec["error"]  = "BROWSERLESS_API_KEY not configured"
         return
 
-    chunk_files: list[str] = []
+    chunk_files: list = []
     chunk_index = 0
 
     rec["started_at"] = datetime.now(timezone.utc).isoformat()
     rec["status"]     = "recording"
-    logger.info(f"[Recorder:{session_id}] Starting chunked recording (chunk={CHUNK_DURATION}s, overlap={OVERLAP}s)")
+    logger.info(f"[Recorder:{session_id}] Starting (chunk={CHUNK_DURATION}s, overlap={OVERLAP}s)")
 
     try:
         while not stop_event.is_set():
-            is_first = (chunk_index == 0)
-            trim      = 0.0 if is_first else float(OVERLAP)
+            trim = 0 if chunk_index == 0 else OVERLAP
 
-            # For chunks after the first, this thread was spawned OVERLAP seconds
-            # before the previous chunk ended — so we start immediately.
-            # Duration: CHUNK_DURATION for all chunks; stop_event checked after.
-            logger.info(f"[Recorder:{session_id}] Recording chunk {chunk_index} (trim={trim}s)")
+            # Create temp file for this chunk
+            tf = tempfile.NamedTemporaryFile(suffix=f"_chunk{chunk_index}.webm", delete=False)
+            tf.close()
+            chunk_path = tf.name
+            chunk_files.append(chunk_path)
 
-            # Use a thread so we can start the next chunk while this one finishes
             chunk_result: dict = {}
-            chunk_event  = threading.Event()
+            chunk_done = threading.Event()
 
-            def _do_chunk(duration: int, trim_s: float, result: dict, done: threading.Event):
+            def _do_chunk(idx, path, trim_s, result, done):
                 try:
-                    data = _record_chunk(viewer_url, duration, trim_s)
-                    result["data"]  = data
-                    result["error"] = None
+                    logger.info(f"[Recorder:{session_id}] Chunk {idx} start (trim={trim_s}s)")
+                    _record_chunk_subprocess(viewer_url, CHUNK_DURATION, trim_s, path)
+                    result["ok"] = True
                 except Exception as ex:
-                    result["data"]  = None
+                    result["ok"]    = False
                     result["error"] = str(ex)
                 finally:
                     done.set()
 
-            chunk_thread = threading.Thread(
+            t = threading.Thread(
                 target=_do_chunk,
-                args=(CHUNK_DURATION, trim, chunk_result, chunk_event),
+                args=(chunk_index, chunk_path, trim, chunk_result, chunk_done),
                 daemon=True,
             )
-            chunk_thread.start()
+            t.start()
 
             # Wait until OVERLAP seconds before this chunk ends, then start next
-            # chunk (unless stop was requested).
             overlap_wait = CHUNK_DURATION - OVERLAP
             stop_signalled = stop_event.wait(timeout=overlap_wait)
 
             if not stop_signalled:
-                # Start next chunk immediately (overlap window begins)
+                # Start next chunk (overlap window begins) — loop continues
                 chunk_index += 1
-                # Loop continues — next iteration starts the new chunk while
-                # the current chunk_thread is still recording its final OVERLAP seconds.
-                # We need to wait for the current chunk to finish before looping.
-                chunk_event.wait()
+                # Wait for current chunk to finish before looping
+                chunk_done.wait()
             else:
                 # Stop requested — wait for current chunk to finish
-                chunk_event.wait()
+                chunk_done.wait()
 
-            if chunk_result.get("error"):
-                raise RuntimeError(f"Chunk {chunk_index} failed: {chunk_result['error']}")
+            if not chunk_result.get("ok"):
+                raise RuntimeError(f"Chunk {chunk_index} failed: {chunk_result.get('error')}")
 
-            # Save chunk to temp file
-            with tempfile.NamedTemporaryFile(suffix=f"_chunk{chunk_index}.webm", delete=False) as tf:
-                tf.write(chunk_result["data"])
-                chunk_files.append(tf.name)
-                logger.info(f"[Recorder:{session_id}] Chunk {chunk_index} saved ({len(chunk_result['data'])} bytes)")
+            sz = os.path.getsize(chunk_path)
+            logger.info(f"[Recorder:{session_id}] Chunk {chunk_index} done ({sz} bytes)")
 
             if stop_signalled:
                 break
 
-        # Concatenate all chunks
+        # Concatenate
         rec["status"] = "concatenating"
         logger.info(f"[Recorder:{session_id}] Concatenating {len(chunk_files)} chunk(s)")
         final_bytes = _concat_chunks(chunk_files)
-        logger.info(f"[Recorder:{session_id}] Final video: {len(final_bytes)} bytes")
 
-        # Upload to S3
+        # Upload
         rec["status"] = "uploading"
         now    = datetime.now(timezone.utc)
         s3_key = f"amplinar-recordings/{amplinar_id}/{now.strftime('%Y%m%d_%H%M%S')}_{session_id}.webm"
-        recording_url = upload_to_s3(final_bytes, s3_key)
+        url    = upload_to_s3(final_bytes, s3_key)
 
-        rec["recording_url"] = recording_url
+        rec["recording_url"] = url
         rec["status"]        = "complete"
         rec["completed_at"]  = now.isoformat()
-        logger.info(f"[Recorder:{session_id}] Complete: {recording_url}")
-
-        _notify_relay(session_id, amplinar_id, recording_url)
+        logger.info(f"[Recorder:{session_id}] Complete: {url}")
+        _notify_relay(session_id, amplinar_id, url)
 
     except Exception as e:
         logger.error(f"[Recorder:{session_id}] Failed: {e}")
@@ -331,7 +273,7 @@ def _recording_worker(rec: dict) -> None:
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "service": "amplinar-recorder", "mode": "browserless-chunked"})
+    return jsonify({"status": "ok", "service": "amplinar-recorder", "mode": "puppeteer-chunked"})
 
 
 @app.route("/start", methods=["POST"])
@@ -369,7 +311,7 @@ def start_recording():
         _recording = rec
 
     threading.Thread(target=_recording_worker, args=(rec,), daemon=True).start()
-    logger.info(f"[Recorder] Started for session {session_id}, amplinar {amplinar_id}")
+    logger.info(f"[Recorder] Started session={session_id} amplinar={amplinar_id}")
     return jsonify({"status": "started", "session_id": session_id})
 
 
@@ -395,7 +337,7 @@ def stop_recording():
     if rec["status"] not in ("recording", "starting"):
         return jsonify({"status": rec["status"], "session_id": rec["session_id"]})
 
-    logger.info(f"[Recorder] Stopping session {rec['session_id']}")
+    logger.info(f"[Recorder] Stop requested for {rec['session_id']}")
     rec["stop_event"].set()
     return jsonify({"status": "stopping", "session_id": rec["session_id"]})
 

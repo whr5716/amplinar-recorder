@@ -2,12 +2,20 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Install Node.js, FFmpeg, and system deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ffmpeg \
+    nodejs \
+    npm \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install puppeteer-core (no bundled browser — we connect to Browserless)
+RUN npm install puppeteer-core
+
+# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Install FFmpeg for chunk concatenation and Playwright browser binaries
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
-RUN playwright install chromium --with-deps 2>/dev/null || true
 
 COPY . .
 

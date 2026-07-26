@@ -354,15 +354,29 @@ def _recording_worker(rec: dict) -> None:
         if lk_proc is None:
             return
         ok = _stop_lk_subprocess(lk_proc)
-        sz = os.path.getsize(lk_out) if lk_out and os.path.exists(lk_out) else 0
-        logger.info(f"[Recorder:{session_id}] LiveKit segment done (ok={ok}, {sz} bytes) → {lk_out}")
-        if sz > 0:
-            segment_files.append(lk_out)
+        # livekit_recorder.js writes rolling segments as <base>_seg000.webm, _seg001.webm etc.
+        # The placeholder lk_out itself stays at 0 bytes — collect the actual segment files.
+        base = lk_out.replace('.webm', '') if lk_out else ''
+        import glob as _glob
+        seg_files = sorted(_glob.glob(f"{base}_seg*.webm")) if base else []
+        if seg_files:
+            for sf in seg_files:
+                sz = os.path.getsize(sf)
+                logger.info(f"[Recorder:{session_id}] Found segment file: {sf} ({sz} bytes)")
+                if sz > 0:
+                    segment_files.append(sf)
         else:
-            try:
+            # Fallback: check placeholder itself
+            sz = os.path.getsize(lk_out) if lk_out and os.path.exists(lk_out) else 0
+            logger.info(f"[Recorder:{session_id}] LiveKit segment done (ok={ok}, {sz} bytes) → {lk_out}")
+            if sz > 0:
+                segment_files.append(lk_out)
+        # Clean up placeholder
+        try:
+            if lk_out and os.path.exists(lk_out):
                 os.unlink(lk_out)
-            except Exception:
-                pass
+        except Exception:
+            pass
         lk_proc = None
         lk_out  = None
 

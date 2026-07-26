@@ -5,7 +5,9 @@ Records a live Amplinar session using overlapping Browserless chunks stitched
 together with FFmpeg — no audible gaps.
 
 Each chunk is recorded by a Node.js subprocess (record_chunk.js) using
-Puppeteer, which avoids the Playwright CDP duplicate-target issue.
+Puppeteer-core. When /stop is called, the current chunk subprocess receives
+SIGTERM, which triggers record_chunk.js to stop recording early and save
+whatever was captured.
 
 Strategy
 --------
@@ -13,6 +15,7 @@ Strategy
 - OVERLAP seconds before a chunk ends, the next chunk starts (default 20s)
 - First OVERLAP seconds of each chunk after the first are trimmed by record_chunk.js
 - FFmpeg concat demuxer joins all chunks seamlessly
+- On /stop: SIGTERM sent to current chunk subprocess → it saves early → concat + upload
 
 API
 ---
@@ -25,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import subprocess
 import tempfile
 import threading
@@ -72,15 +76,18 @@ def _record_chunk_subprocess(
     duration_secs: int,
     trim_secs: int,
     output_path: str,
+    proc_holder: dict,          # {"proc": None} — filled in so caller can SIGTERM
 ) -> None:
     """
-    Calls record_chunk.js as a subprocess.
+    Launches record_chunk.js as a Popen subprocess and waits for it.
+    Stores the Popen object in proc_holder["proc"] so the stop handler
+    can send SIGTERM to trigger early-stop recording.
     Raises RuntimeError on failure.
     """
     env = os.environ.copy()
     env["BROWSERLESS_API_KEY"] = BROWSERLESS_API_KEY
 
-    result = subprocess.run(
+    proc = subprocess.Popen(
         [
             "node",
             CHUNK_JS,
@@ -90,15 +97,22 @@ def _record_chunk_subprocess(
             output_path,
         ],
         env=env,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=duration_secs + 120,     # generous timeout
     )
+    proc_holder["proc"] = proc
 
-    logger.info(f"[chunk stdout] {result.stdout.strip()}")
-    if result.returncode != 0:
-        logger.error(f"[chunk stderr] {result.stderr.strip()}")
-        raise RuntimeError(f"record_chunk.js exited {result.returncode}: {result.stderr.strip()[-300:]}")
+    stdout, stderr = proc.communicate(timeout=duration_secs + 120)
+
+    if stdout:
+        logger.info(f"[chunk stdout] {stdout.strip()}")
+    if proc.returncode != 0:
+        if stderr:
+            logger.error(f"[chunk stderr] {stderr.strip()}")
+        raise RuntimeError(
+            f"record_chunk.js exited {proc.returncode}: {stderr.strip()[-300:]}"
+        )
 
 
 # ── FFmpeg concat ─────────────────────────────────────────────────────────────
@@ -167,9 +181,14 @@ def _notify_relay(session_id: str, amplinar_id: str, recording_url: str) -> None
 # ── Main recording worker ─────────────────────────────────────────────────────
 def _recording_worker(rec: dict) -> None:
     """
-    Orchestrates overlapping chunks:
-      - Chunk 0: records for CHUNK_DURATION seconds, no trim
-      - Chunk N: starts OVERLAP seconds before chunk N-1 ends, trimmed by OVERLAP
+    Orchestrates overlapping chunks.
+
+    Stop mechanism:
+      - stop_event is set by /stop
+      - current_proc_holder["proc"] holds the active Popen object
+      - When stop_event fires, we send SIGTERM to the subprocess, which
+        causes record_chunk.js to stop recording early and save the file
+      - We then wait for the subprocess to exit, concat, and upload
     """
     session_id  = rec["session_id"]
     amplinar_id = rec["amplinar_id"]
@@ -183,13 +202,15 @@ def _recording_worker(rec: dict) -> None:
 
     chunk_files: list = []
     chunk_index = 0
+    current_proc_holder: dict = {"proc": None}
+    rec["_proc_holder"] = current_proc_holder   # expose so stop handler can SIGTERM
 
     rec["started_at"] = datetime.now(timezone.utc).isoformat()
     rec["status"]     = "recording"
     logger.info(f"[Recorder:{session_id}] Starting (chunk={CHUNK_DURATION}s, overlap={OVERLAP}s)")
 
     try:
-        while not stop_event.is_set():
+        while True:
             trim = 0 if chunk_index == 0 else OVERLAP
 
             # Create temp file for this chunk
@@ -201,10 +222,10 @@ def _recording_worker(rec: dict) -> None:
             chunk_result: dict = {}
             chunk_done = threading.Event()
 
-            def _do_chunk(idx, path, trim_s, result, done):
+            def _do_chunk(idx, path, trim_s, result, done, holder):
                 try:
                     logger.info(f"[Recorder:{session_id}] Chunk {idx} start (trim={trim_s}s)")
-                    _record_chunk_subprocess(viewer_url, CHUNK_DURATION, trim_s, path)
+                    _record_chunk_subprocess(viewer_url, CHUNK_DURATION, trim_s, path, holder)
                     result["ok"] = True
                 except Exception as ex:
                     result["ok"]    = False
@@ -214,7 +235,7 @@ def _recording_worker(rec: dict) -> None:
 
             t = threading.Thread(
                 target=_do_chunk,
-                args=(chunk_index, chunk_path, trim, chunk_result, chunk_done),
+                args=(chunk_index, chunk_path, trim, chunk_result, chunk_done, current_proc_holder),
                 daemon=True,
             )
             t.start()
@@ -223,30 +244,58 @@ def _recording_worker(rec: dict) -> None:
             overlap_wait = CHUNK_DURATION - OVERLAP
             stop_signalled = stop_event.wait(timeout=overlap_wait)
 
-            if not stop_signalled:
-                # Start next chunk (overlap window begins) — loop continues
-                chunk_index += 1
-                # Wait for current chunk to finish before looping
-                chunk_done.wait()
-            else:
-                # Stop requested — wait for current chunk to finish
-                chunk_done.wait()
-
-            if not chunk_result.get("ok"):
-                raise RuntimeError(f"Chunk {chunk_index} failed: {chunk_result.get('error')}")
-
-            sz = os.path.getsize(chunk_path)
-            logger.info(f"[Recorder:{session_id}] Chunk {chunk_index} done ({sz} bytes)")
-
             if stop_signalled:
+                # Send SIGTERM to the Node.js subprocess so it stops recording
+                # early and saves whatever it has
+                proc = current_proc_holder.get("proc")
+                if proc and proc.poll() is None:
+                    logger.info(f"[Recorder:{session_id}] Sending SIGTERM to chunk {chunk_index}")
+                    try:
+                        proc.send_signal(signal.SIGTERM)
+                    except Exception as e:
+                        logger.warning(f"[Recorder:{session_id}] SIGTERM failed: {e}")
+
+                # Wait for the subprocess to finish (it will save the partial recording)
+                chunk_done.wait(timeout=60)
+
+                if not chunk_result.get("ok"):
+                    logger.warning(
+                        f"[Recorder:{session_id}] Chunk {chunk_index} returned error after stop: "
+                        f"{chunk_result.get('error')} — checking if file exists anyway"
+                    )
+                    # Even if returncode != 0, the file may have been written
+                    if not os.path.exists(chunk_path) or os.path.getsize(chunk_path) == 0:
+                        raise RuntimeError(
+                            f"Chunk {chunk_index} failed and no output file: {chunk_result.get('error')}"
+                        )
+                    logger.info(f"[Recorder:{session_id}] Chunk {chunk_index} file exists despite error — using it")
+
+                sz = os.path.getsize(chunk_path) if os.path.exists(chunk_path) else 0
+                logger.info(f"[Recorder:{session_id}] Chunk {chunk_index} done ({sz} bytes)")
                 break
 
-        # Concatenate
-        rec["status"] = "concatenating"
-        logger.info(f"[Recorder:{session_id}] Concatenating {len(chunk_files)} chunk(s)")
-        final_bytes = _concat_chunks(chunk_files)
+            else:
+                # Overlap window: start next chunk, wait for this one to finish
+                chunk_index += 1
+                chunk_done.wait()
 
-        # Upload
+                if not chunk_result.get("ok"):
+                    raise RuntimeError(f"Chunk {chunk_index - 1} failed: {chunk_result.get('error')}")
+
+                sz = os.path.getsize(chunk_path)
+                logger.info(f"[Recorder:{session_id}] Chunk {chunk_index - 1} done ({sz} bytes)")
+                # Loop continues to start next chunk
+
+        # ── Post-recording: concat + upload ───────────────────────────────────
+        # Filter out any zero-byte files
+        valid_chunks = [f for f in chunk_files if os.path.exists(f) and os.path.getsize(f) > 0]
+        if not valid_chunks:
+            raise RuntimeError("No valid chunk files to upload")
+
+        rec["status"] = "concatenating"
+        logger.info(f"[Recorder:{session_id}] Concatenating {len(valid_chunks)} chunk(s)")
+        final_bytes = _concat_chunks(valid_chunks)
+
         rec["status"] = "uploading"
         now    = datetime.now(timezone.utc)
         s3_key = f"amplinar-recordings/{amplinar_id}/{now.strftime('%Y%m%d_%H%M%S')}_{session_id}.webm"
@@ -303,6 +352,7 @@ def start_recording():
             "viewer_url":    viewer_url,
             "status":        "starting",
             "stop_event":    threading.Event(),
+            "_proc_holder":  {"proc": None},
             "started_at":    None,
             "completed_at":  None,
             "recording_url": None,
@@ -339,6 +389,16 @@ def stop_recording():
 
     logger.info(f"[Recorder] Stop requested for {rec['session_id']}")
     rec["stop_event"].set()
+
+    # Also SIGTERM the subprocess immediately (belt-and-suspenders)
+    proc = rec.get("_proc_holder", {}).get("proc")
+    if proc and proc.poll() is None:
+        logger.info(f"[Recorder] Sending SIGTERM to subprocess from /stop route")
+        try:
+            proc.send_signal(signal.SIGTERM)
+        except Exception as e:
+            logger.warning(f"[Recorder] SIGTERM from route failed: {e}")
+
     return jsonify({"status": "stopping", "session_id": rec["session_id"]})
 
 

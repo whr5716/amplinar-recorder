@@ -8,12 +8,15 @@
  *   node record_chunk.js <viewer_url> <duration_ms> <trim_ms> <output_path>
  *
  * Exits 0 on success, non-zero on failure.
- * Writes raw WebM bytes to <output_path>.
+ * Writes trimmed WebM bytes to <output_path>.
+ *
+ * Stop behaviour: on SIGTERM, stops recording early and saves whatever
+ * was captured — so /stop can kill the subprocess and still get a file.
  */
 
-const puppeteer = require("puppeteer-core");
-const fs        = require("fs");
-const { execSync } = require("child_process");
+const puppeteer    = require("puppeteer-core");
+const fs           = require("fs");
+const { execSync, spawnSync } = require("child_process");
 
 const [,, viewerUrl, durationMs, trimMs, outputPath] = process.argv;
 
@@ -33,6 +36,21 @@ if (!TOKEN) {
 
 const WS_ENDPOINT = `wss://production-sfo.browserless.io?token=${TOKEN}&headless=false&stealth&record=true&timeout=900000`;
 
+// ── Graceful stop ─────────────────────────────────────────────────────────────
+// When recorder.py kills us (SIGTERM), we want to stop recording and save
+// whatever we have rather than dying with no output.
+let _stopRecording = null;   // set to a function once recording starts
+let _stopping = false;
+
+process.on("SIGTERM", () => {
+  console.log("[chunk] SIGTERM received — stopping recording early");
+  _stopping = true;
+  if (_stopRecording) {
+    _stopRecording();
+  }
+});
+
+// ── Main ──────────────────────────────────────────────────────────────────────
 (async () => {
   let browser;
   try {
@@ -49,7 +67,14 @@ const WS_ENDPOINT = `wss://production-sfo.browserless.io?token=${TOKEN}&headless
     await cdp.send("Browserless.startRecording");
     console.log("[chunk] Recording started");
 
-    await new Promise(resolve => setTimeout(resolve, DURATION));
+    // Wait for duration OR early stop signal
+    await new Promise(resolve => {
+      const timer = setTimeout(resolve, DURATION);
+      _stopRecording = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
 
     console.log("[chunk] Stopping recording");
     const response = await cdp.send("Browserless.stopRecording", { encoding: "base64" });
@@ -65,8 +90,11 @@ const WS_ENDPOINT = `wss://production-sfo.browserless.io?token=${TOKEN}&headless
       const tmpPath = outputPath + ".raw.webm";
       fs.writeFileSync(tmpPath, rawBytes);
       const trimSecs = (TRIM / 1000).toFixed(3);
-      execSync(`ffmpeg -y -ss ${trimSecs} -i "${tmpPath}" -c copy "${outputPath}"`, { stdio: "pipe" });
+      const r = spawnSync("ffmpeg", ["-y", "-ss", trimSecs, "-i", tmpPath, "-c", "copy", outputPath], { stdio: "pipe" });
       fs.unlinkSync(tmpPath);
+      if (r.status !== 0) {
+        throw new Error(`FFmpeg trim failed: ${r.stderr.toString().slice(-200)}`);
+      }
       console.log(`[chunk] Trimmed ${trimSecs}s, saved to ${outputPath}`);
     } else {
       fs.writeFileSync(outputPath, rawBytes);

@@ -7,14 +7,20 @@
  * which are then muxed by FFmpeg into a WebM file.
  *
  * Usage:
- *   node livekit_recorder.js <lk_url> <lk_token> <output_path>
+ *   node livekit_recorder.js <lk_url> <lk_room> <output_path>
+ *
+ * Env vars required:
+ *   LIVEKIT_API_KEY    — LiveKit API key
+ *   LIVEKIT_API_SECRET — LiveKit API secret
+ *
+ * The token is generated internally using livekit-server-sdk (same as the
+ * relay) to guarantee the correct JWT format. Passing a pre-baked token
+ * as a CLI arg caused 401 errors due to subtle encoding differences.
  *
  * SIGTERM → gracefully stop capture and mux output.
  *
  * Key fix (v2): TrackSubscribed handler uses detached async IIFEs for the
- * frame loops so they don't block the event emitter. The original code used
- * `for await` directly inside the event handler which prevented the second
- * track's TrackSubscribed event from ever firing.
+ * frame loops so they don't block the event emitter.
  */
 
 'use strict';
@@ -27,14 +33,29 @@ const {
   AudioStream,
 } = require('@livekit/rtc-node');
 
-const { spawn, spawnSync } = require('child_process');
+const { AccessToken } = require('livekit-server-sdk');
+const { spawnSync } = require('child_process');
 const fs = require('fs');
 
 // ── Args ──────────────────────────────────────────────────────────────────────
-const [,, LK_URL, LK_TOKEN, OUTPUT_PATH] = process.argv;
-if (!LK_URL || !LK_TOKEN || !OUTPUT_PATH) {
-  console.error('[lk-rec] Usage: node livekit_recorder.js <lk_url> <lk_token> <output_path>');
+const [,, LK_URL, LK_ROOM, OUTPUT_PATH] = process.argv;
+if (!LK_URL || !LK_ROOM || !OUTPUT_PATH) {
+  console.error('[lk-rec] Usage: node livekit_recorder.js <lk_url> <lk_room> <output_path>');
   process.exit(1);
+}
+
+const LK_API_KEY    = process.env.LIVEKIT_API_KEY;
+const LK_API_SECRET = process.env.LIVEKIT_API_SECRET;
+if (!LK_API_KEY || !LK_API_SECRET) {
+  console.error('[lk-rec] LIVEKIT_API_KEY and LIVEKIT_API_SECRET env vars are required');
+  process.exit(1);
+}
+
+async function makeToken(room) {
+  const identity = `amplinar-recorder-${Date.now()}`;
+  const at = new AccessToken(LK_API_KEY, LK_API_SECRET, { identity, ttl: '4h' });
+  at.addGrant({ roomJoin: true, room, canPublish: false, canSubscribe: true, canPublishData: false });
+  return at.toJwt();
 }
 
 // ── Video/audio config ────────────────────────────────────────────────────────
@@ -228,8 +249,9 @@ async function gracefulStop() {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
-  console.log(`[lk-rec] Connecting to ${LK_URL}`);
+  console.log(`[lk-rec] Connecting to ${LK_URL} room=${LK_ROOM}`);
   console.log(`[lk-rec] Output: ${OUTPUT_PATH}`);
+  console.log(`[lk-rec] API key: ${LK_API_KEY}`);
 
   room = new Room();
 
@@ -260,6 +282,11 @@ async function main() {
       gracefulStop();
     }
   });
+
+  // Generate token using livekit-server-sdk (same as relay) for guaranteed format
+  console.log(`[lk-rec] Generating token for room: ${LK_ROOM}`);
+  const LK_TOKEN = await makeToken(LK_ROOM);
+  console.log('[lk-rec] Token generated OK');
 
   // Connect with autoSubscribe:true so the server auto-subscribes us to all tracks
   await room.connect(LK_URL, LK_TOKEN, { autoSubscribe: true });

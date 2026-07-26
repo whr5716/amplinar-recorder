@@ -329,8 +329,9 @@ def _recording_worker(rec: dict) -> None:
         tf = tempfile.NamedTemporaryFile(suffix="_lk.webm", delete=False)
         tf.close()
         lk_out = tf.name
-        token = _make_lk_token(room_name, identity=f"recorder-{session_id[:8]}")
-        lk_proc = _start_lk_subprocess(LIVEKIT_URL, token, lk_out)
+        # Pass room name — livekit_recorder.js now generates its own token
+        # internally using livekit-server-sdk (same as relay) to avoid 401 errors
+        lk_proc = _start_lk_subprocess(LIVEKIT_URL, room_name, lk_out)
         logger.info(f"[Recorder:{session_id}] LiveKit segment started → {lk_out}")
 
     def _stop_lk_segment():

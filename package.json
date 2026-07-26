@@ -4,6 +4,7 @@
   "description": "LiveKit direct track recorder for Amplinar sessions",
   "main": "livekit_recorder.js",
   "dependencies": {
-    "@livekit/rtc-node": "^0.13.31"
+    "@livekit/rtc-node": "^0.13.31",
+    "livekit-server-sdk": "^2.17.0"
   }
 }

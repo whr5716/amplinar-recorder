@@ -5,7 +5,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browser binaries (needed for the sync_playwright CDP connection)
+# Install FFmpeg for chunk concatenation and Playwright browser binaries
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 RUN playwright install chromium --with-deps 2>/dev/null || true
 
 COPY . .

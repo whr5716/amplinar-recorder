@@ -177,7 +177,7 @@ def _recording_worker(rec: dict) -> None:
                 "-s", f"{DISPLAY_WIDTH}x{DISPLAY_HEIGHT}",
                 "-i", display,
                 "-f", "pulse",
-                "-i", "virtual.monitor",
+                "-i", "default",
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
                 "-crf", "23",

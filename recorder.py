@@ -110,17 +110,20 @@ def upload_to_s3(data: bytes, s3_key: str) -> str:
 
 
 # ── Relay notification ────────────────────────────────────────────────────────
-def _notify_relay(session_id: str, amplinar_id: str, recording_url: str) -> None:
+def _notify_relay(session_id: str, amplinar_id: str, recording_url: str,
+                  title: str = "", duration_seconds: int = 0) -> None:
     if not RELAY_URL:
         return
     try:
         resp = requests.post(
             f"{RELAY_URL}/api/session/recording-complete",
             json={
-                "session_id":  session_id,
-                "amplinar_id": amplinar_id,
-                "s3_url":      recording_url,
-                "recorded_at": datetime.now(timezone.utc).isoformat(),
+                "session_id":       session_id,
+                "amplinar_id":      amplinar_id,
+                "title":            title,
+                "s3_url":           recording_url,
+                "duration_seconds": duration_seconds,
+                "recorded_at":      datetime.now(timezone.utc).isoformat(),
             },
             headers={"x-api-key": RELAY_API_KEY},
             timeout=10,
@@ -478,7 +481,9 @@ def _recording_worker(rec: dict) -> None:
         rec["status"]        = "complete"
         rec["completed_at"]  = now.isoformat()
         logger.info(f"[Recorder:{session_id}] Complete: {url}")
-        _notify_relay(session_id, amplinar_id, url)
+        duration_secs = int((now - rec["started_at"]).total_seconds()) if rec.get("started_at") else 0
+        _notify_relay(session_id, amplinar_id, url,
+                      title=rec.get("amplinar_title", ""), duration_seconds=duration_secs)
 
     except Exception as e:
         logger.error(f"[Recorder:{session_id}] Failed: {e}")
@@ -526,7 +531,8 @@ def segment_complete():
     if s3_url and s3_url.startswith("https://"):
         logger.info(f"[Segment] Segment {seg_idx} already in S3: {s3_url}")
         # Notify relay of partial recording URL
-        _notify_relay(session_id, amplinar_id, s3_url)
+        _notify_relay(session_id, amplinar_id, s3_url,
+                      title=rec.get("amplinar_title", ""))
         # Store URL in active recording state
         with _recording_lock:
             rec = _recording
@@ -553,7 +559,8 @@ def segment_complete():
                 s3_key = f"amplinar-recordings/{amplinar_id}/{now.strftime('%Y%m%d_%H%M%S')}_seg{seg_idx:03d}_{session_id}.webm"
                 url    = upload_to_s3(data_bytes, s3_key)
                 logger.info(f"[Segment] Segment {seg_idx} uploaded: {url}")
-                _notify_relay(session_id, amplinar_id, url)
+                _notify_relay(session_id, amplinar_id, url,
+                              title=rec.get("amplinar_title", ""))
             except Exception as e:
                 logger.error(f"[Segment] Upload failed for segment {seg_idx}: {e}")
             finally:
@@ -577,14 +584,13 @@ def start_recording():
     if not check_auth():
         return jsonify({"error": "Unauthorized"}), 401
 
-    data        = request.get_json() or {}
-    session_id  = data.get("session_id")
-    amplinar_id = data.get("amplinar_id")
-    room_name   = data.get("room_name") or session_id  # room_name defaults to session_id
-
+    data           = request.get_json() or {}
+    session_id     = data.get("session_id")
+    amplinar_id    = data.get("amplinar_id")
+    amplinar_title = data.get("amplinar_title") or amplinar_id or ""
+    room_name      = data.get("room_name") or session_id  # room_name defaults to session_id
     if not session_id or not amplinar_id:
         return jsonify({"error": "session_id and amplinar_id are required"}), 400
-
     with _recording_lock:
         global _recording
         if _recording and _recording.get("status") in ("recording", "starting"):
@@ -592,10 +598,10 @@ def start_recording():
                 "error": "A recording is already in progress",
                 "session_id": _recording["session_id"],
             }), 409
-
         rec = {
             "session_id":         session_id,
             "amplinar_id":        amplinar_id,
+            "amplinar_title":     amplinar_title,
             "room_name":          room_name,
             "status":             "starting",
             "stop_event":         threading.Event(),

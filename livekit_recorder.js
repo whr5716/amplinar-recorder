@@ -211,7 +211,20 @@ async function main() {
   });
 
   await room.connect(LK_URL, LK_TOKEN, { autoSubscribe: true });
-  console.log(`[lk-rec] Connected to room: ${room.name}`);
+  console.log(`[lk-rec] Connected to room: ${room.name}, participants: ${room.remoteParticipants.size}`);
+
+  // Scan existing participants — if the avatar agent is already publishing,
+  // TrackSubscribed may not fire retroactively. Manually subscribe to any
+  // already-published tracks.
+  for (const [, participant] of room.remoteParticipants) {
+    console.log(`[lk-rec] Existing participant: ${participant.identity} (${participant.trackPublications.size} tracks)`);
+    for (const [, pub] of participant.trackPublications) {
+      console.log(`[lk-rec] Existing track: kind=${pub.kind} subscribed=${pub.isSubscribed} muted=${pub.isMuted}`);
+      if (!pub.isSubscribed) {
+        try { pub.setSubscribed(true); } catch (e) { console.warn('[lk-rec] setSubscribed error:', e.message); }
+      }
+    }
+  }
 
   // Wait for stop signal
   await new Promise(resolve => {

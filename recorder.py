@@ -89,7 +89,6 @@ def _make_lk_token(room_name: str, identity: str = "amplinar-recorder") -> str:
             "canPublish": False,
             "canSubscribe": True,
             "canPublishData": False,
-            "hidden": True,   # don't show recorder in participant list
         },
     }
     return jwt.encode(payload, LIVEKIT_API_SECRET, algorithm="HS256")

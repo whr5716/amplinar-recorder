@@ -177,12 +177,11 @@ async function gracefulStop() {
 
   console.log('[lk-rec] Stopping capture...');
 
-  // Close streams (this ends the for-await loops)
-  if (videoStream) { try { videoStream.cancel(); } catch (_) {} }
-  if (audioStream) { try { audioStream.cancel(); } catch (_) {} }
-
-  // Small delay to let the loops drain their last frames
-  await new Promise(r => setTimeout(r, 500));
+  // stopping=true signals the reader loops to exit on their next iteration.
+  // Do NOT call stream.cancel() while a reader holds the lock — it throws
+  // ERR_INVALID_STATE and crashes the process before FFmpeg can run.
+  // Instead, wait up to 2s for the loops to drain and exit naturally.
+  await new Promise(r => setTimeout(r, 2000));
 
   // Disconnect from room
   if (room) { try { await room.disconnect(); } catch (_) {} }

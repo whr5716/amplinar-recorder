@@ -123,42 +123,10 @@ def _recording_worker(rec: dict) -> None:
         rec["xvfb_proc"] = xvfb_proc
         time.sleep(1.5)  # Give Xvfb time to start
 
-        # 1b. Start PulseAudio virtual audio sink (needed for FFmpeg audio capture)
-        pulse_socket = "/tmp/pulse-native"
-        env["PULSE_SERVER"] = f"unix:{pulse_socket}"
-        try:
-            # Start PulseAudio daemon
-            subprocess.run(
-                ["pulseaudio", "--start", "--daemonize=yes", "--exit-idle-time=-1"],
-                env=env, check=True, capture_output=True, timeout=10
-            )
-            time.sleep(2)  # Give PulseAudio time to start
-            # Find the actual PulseAudio socket path
-            import glob as _glob
-            sockets = _glob.glob("/run/user/*/pulse/native") + _glob.glob("/tmp/pulse-*/native")
-            if sockets:
-                env["PULSE_SERVER"] = f"unix:{sockets[0]}"
-                logger.info(f"[Recorder:{session_id}] PulseAudio socket: {sockets[0]}")
-            else:
-                # Fall back to default (no explicit socket)
-                env.pop("PULSE_SERVER", None)
-                logger.info(f"[Recorder:{session_id}] PulseAudio socket not found, using default")
-            # Load a null sink so FFmpeg always has an audio source
-            r1 = subprocess.run(
-                ["pactl", "load-module", "module-null-sink", "sink_name=virtual"],
-                env=env, capture_output=True, timeout=5
-            )
-            r2 = subprocess.run(
-                ["pactl", "set-default-source", "virtual.monitor"],
-                env=env, capture_output=True, timeout=5
-            )
-            logger.info(f"[Recorder:{session_id}] PulseAudio ready (null-sink={r1.returncode}, default-src={r2.returncode})")
-            if r1.returncode != 0:
-                logger.warning(f"[Recorder:{session_id}] pactl null-sink stderr: {r1.stderr.decode(errors='replace')}")
-            if r2.returncode != 0:
-                logger.warning(f"[Recorder:{session_id}] pactl default-src stderr: {r2.stderr.decode(errors='replace')}")
-        except Exception as pa_err:
-            logger.warning(f"[Recorder:{session_id}] PulseAudio start failed: {pa_err}")
+        # Note: PulseAudio is unreliable in headless Docker containers.
+        # We use FFmpeg's lavfi anullsrc for silent audio — sufficient for video-only recordings.
+        # Real audio capture can be added later with a working PulseAudio setup.
+        logger.info(f"[Recorder:{session_id}] Using silent audio (lavfi anullsrc)")
 
         # 2. Start Chromium (headless=false so it renders to the virtual display)
         logger.info(f"[Recorder:{session_id}] Starting Chromium → {viewer_url}")
@@ -193,8 +161,8 @@ def _recording_worker(rec: dict) -> None:
                 "-r", "30",
                 "-s", f"{DISPLAY_WIDTH}x{DISPLAY_HEIGHT}",
                 "-i", display,
-                "-f", "pulse",
-                "-i", "default",
+                "-f", "lavfi",
+                "-i", "anullsrc=r=44100:cl=stereo",
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
                 "-crf", "23",

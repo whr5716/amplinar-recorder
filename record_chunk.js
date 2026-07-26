@@ -10,6 +10,10 @@
  * Exits 0 on success, non-zero on failure.
  * Writes trimmed WebM bytes to <output_path>.
  *
+ * Join gate: after navigating to viewer.html, the recorder auto-fills
+ * the name and email fields and clicks "Join Session" so the Browserless
+ * browser actually enters the session before recording starts.
+ *
  * Stop behaviour: on SIGTERM, stops recording early and saves whatever
  * was captured — so /stop can kill the subprocess and still get a file.
  */
@@ -28,6 +32,10 @@ if (!viewerUrl || !durationMs || !outputPath) {
 const TOKEN    = process.env.BROWSERLESS_API_KEY;
 const DURATION = parseInt(durationMs, 10);
 const TRIM     = parseInt(trimMs, 10) || 0;
+
+// Recorder identity — shown in the host panel viewer list
+const RECORDER_NAME  = process.env.RECORDER_NAME  || "Amplinar Recorder";
+const RECORDER_EMAIL = process.env.RECORDER_EMAIL || "recorder@amplinar.com";
 
 if (!TOKEN) {
   console.error("BROWSERLESS_API_KEY not set");
@@ -50,6 +58,11 @@ process.on("SIGTERM", () => {
   }
 });
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 (async () => {
   let browser;
@@ -63,6 +76,44 @@ process.on("SIGTERM", () => {
     await page.setViewport({ width: 1280, height: 720 });
     await page.goto(viewerUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
 
+    // ── Auto-join the session gate ────────────────────────────────────────────
+    // Wait up to 10s for the name input to appear (gate may take a moment to render)
+    console.log("[chunk] Waiting for join gate...");
+    try {
+      await page.waitForSelector("#name-input", { visible: true, timeout: 10000 });
+
+      // Fill in name
+      await page.click("#name-input", { clickCount: 3 });
+      await page.type("#name-input", RECORDER_NAME);
+
+      // Fill in email if the field exists
+      const emailEl = await page.$("#email-input");
+      if (emailEl) {
+        await page.click("#email-input", { clickCount: 3 });
+        await page.type("#email-input", RECORDER_EMAIL);
+      }
+
+      // Small pause so validation can run
+      await sleep(500);
+
+      // Click Join Session button
+      const joinBtn = await page.$("#join-btn");
+      if (joinBtn) {
+        await joinBtn.click();
+        console.log("[chunk] Clicked Join Session");
+      } else {
+        console.log("[chunk] No join button found — proceeding anyway");
+      }
+
+      // Wait briefly for the gate to dismiss and the session to load
+      await sleep(3000);
+      console.log("[chunk] Join gate passed");
+    } catch (gateErr) {
+      // Gate may not be present (e.g. session already live and gate dismissed)
+      console.log("[chunk] Join gate not found or already dismissed:", gateErr.message);
+    }
+
+    // ── Start recording ───────────────────────────────────────────────────────
     const cdp = await page.createCDPSession();
     await cdp.send("Browserless.startRecording");
     console.log("[chunk] Recording started");

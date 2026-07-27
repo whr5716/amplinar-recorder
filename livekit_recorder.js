@@ -1,6 +1,6 @@
 
 /**
- * livekit_recorder.js  (v7 — single-FFmpeg A/V sync)
+ * livekit_recorder.js  (v8 — video delay queue for A/V sync)
  * =========================================================
  * Connects to a LiveKit room, captures avatar video + audio, and writes
  * rolling MP4 segments (H.264/AAC).
@@ -135,9 +135,17 @@ let currentOut      = null;    // output MP4 path for current segment
 let ffmpegStarted   = false;   // true once FFmpeg has been spawned
 
 // Audio pre-roll buffer — holds PCM chunks that arrive before the first video
-// frame triggers FFmpeg start.  Flushed immediately when FFmpeg starts so
-// audio and video begin encoding at exactly the same moment.
+// frame triggers FFmpeg start.  Discarded when FFmpeg starts (we don't want
+// pre-video audio in the recording).
 let audioPrebuffer  = [];      // Array<Buffer>
+
+// Video delay queue — holds encoded YUV frames for VIDEO_DELAY_MS before
+// writing to FFmpeg.  This compensates for the avatar's audio arriving at the
+// recorder slightly later than the video (network path difference).
+// At 30 fps, 1500 ms = 45 frames.  Tune VIDEO_DELAY_MS if sync is still off.
+const VIDEO_DELAY_MS = 1500;
+const VIDEO_DELAY_FRAMES = Math.round(VIDEO_FPS * VIDEO_DELAY_MS / 1000); // 45
+let videoDelayQueue = [];   // Array<{y,u,v}> — buffered frames not yet sent to FFmpeg
 
 // ── Callback to recorder.py ───────────────────────────────────────────────────
 function notifySegmentComplete(mergedPath, s3Url, segIdx) {
@@ -336,23 +344,13 @@ function startVideoCapture(track) {
             segmentStartMs = Date.now();
             ffmpegStarted  = true;
 
-            // Flush the tail of the audio prebuffer into FFmpeg.
-            // The prebuffer holds audio that arrived before the first video frame.
-            // We keep the last ~1.5 seconds (≈72 frames at 48kHz/1024 samples)
-            // because those frames correspond to the avatar's first words which
-            // start at roughly the same time as the first video frame.
-            // Frames older than 1.5s are discarded to avoid audio running ahead.
-            const KEEP_FRAMES = 72; // ~1.5 seconds of audio at 48kHz/1024 samples
+            // Discard the audio prebuffer — pre-video audio should not be
+            // included in the recording.  Audio encoding starts fresh from t=0.
             if (audioPrebuffer.length > 0) {
-              const tail = audioPrebuffer.slice(-KEEP_FRAMES);
-              const discarded = audioPrebuffer.length - tail.length;
-              console.log(`[lk-rec] Flushing ${tail.length} prebuffer frames into FFmpeg (discarded ${discarded} older frames)`);
-              for (const buf of tail) {
-                writeAudioFrame(buf);
-                audioFrameCount++;
-              }
+              console.log(`[lk-rec] Discarding ${audioPrebuffer.length} pre-video audio frames (A/V sync)`);
               audioPrebuffer = [];
             }
+            console.log(`[lk-rec] Video delay queue: ${VIDEO_DELAY_FRAMES} frames (${VIDEO_DELAY_MS}ms) — buffering before write`);
 
             firstFrame = false;
           }
@@ -363,10 +361,20 @@ function startVideoCapture(track) {
           const uPlane = i420.getPlane(1);
           const vPlane = i420.getPlane(2);
           if (yPlane && uPlane && vPlane) {
-            writeVideoFrame(Buffer.from(yPlane), Buffer.from(uPlane), Buffer.from(vPlane));
-            videoFrameCount++;
-            if (videoFrameCount % 300 === 0) {
-              console.log(`[lk-rec] Video frames: ${videoFrameCount} (${actualWidth}x${actualHeight})`);
+            // Push frame into the delay queue
+            videoDelayQueue.push({
+              y: Buffer.from(yPlane),
+              u: Buffer.from(uPlane),
+              v: Buffer.from(vPlane),
+            });
+            // Once the queue is full (delay reached), drain one frame per incoming frame
+            if (videoDelayQueue.length > VIDEO_DELAY_FRAMES) {
+              const delayed = videoDelayQueue.shift();
+              writeVideoFrame(delayed.y, delayed.u, delayed.v);
+              videoFrameCount++;
+              if (videoFrameCount % 300 === 0) {
+                console.log(`[lk-rec] Video frames: ${videoFrameCount} (${actualWidth}x${actualHeight})`);
+              }
             }
           }
 
@@ -383,6 +391,15 @@ function startVideoCapture(track) {
     } finally {
       try { reader.releaseLock(); } catch (_) {}
     }
+    // Flush remaining frames from the delay queue
+    console.log(`[lk-rec] Flushing ${videoDelayQueue.length} delayed video frames`);
+    for (const delayed of videoDelayQueue) {
+      if (videoPipe && !videoPipe.destroyed) {
+        writeVideoFrame(delayed.y, delayed.u, delayed.v);
+        videoFrameCount++;
+      }
+    }
+    videoDelayQueue = [];
     console.log(`[lk-rec] Video capture ended (${videoFrameCount} frames)`);
     // Close video pipe — FFmpeg will finish encoding when audio pipe also closes
     try { if (videoPipe && !videoPipe.destroyed) videoPipe.end(); } catch (_) {}

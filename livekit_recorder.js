@@ -269,7 +269,7 @@ async function rollSegment() {
   await closeFFmpegSegment(oldVProc, oldAProc, oldVOut, oldAOut, oldIdx);
 
   // Merge old segment and notify
-  const mergedOut = segmentPath(oldIdx, '.webm');
+  const mergedOut = segmentPath(oldIdx, '.mp4');
   mergeSegment(oldVOut, oldAOut, mergedOut, oldIdx);
 
   segmentRolling = false;
@@ -484,11 +484,15 @@ async function main() {
   room = new Room();
 
   room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
-    console.log(`[lk-rec] TrackSubscribed: kind=${track.kind} from ${participant.identity}`);
+    console.log(`[lk-rec] TrackSubscribed: kind=${track.kind} (${track.kind === TrackKind.KIND_AUDIO ? 'AUDIO' : track.kind === TrackKind.KIND_VIDEO ? 'VIDEO' : 'UNKNOWN'}) from ${participant.identity} sid=${track.sid}`);
     if (track.kind === TrackKind.KIND_VIDEO && !videoStream) {
+      console.log('[lk-rec] → Starting video capture from TrackSubscribed');
       startVideoCapture(track);
     } else if (track.kind === TrackKind.KIND_AUDIO && !audioStream) {
+      console.log('[lk-rec] → Starting audio capture from TrackSubscribed');
       startAudioCapture(track);
+    } else {
+      console.log(`[lk-rec] → Skipping track: videoStream=${!!videoStream} audioStream=${!!audioStream}`);
     }
   });
 
@@ -514,13 +518,15 @@ async function main() {
 
   await room.connect(LK_URL, LK_TOKEN, { autoSubscribe: true });
   console.log(`[lk-rec] Connected to room: ${room.name}, participants: ${room.remoteParticipants.size}`);
+  console.log(`[lk-rec] autoSubscribe=true — TrackSubscribed events will fire for all tracks`);
 
   // Subscribe to any existing unsubscribed tracks, and start capture for already-subscribed ones
   // (TrackSubscribed events for pre-existing tracks may have fired before our handler was registered)
+  console.log(`[lk-rec] Scanning ${room.remoteParticipants.size} existing participant(s) for tracks...`);
   for (const [, participant] of room.remoteParticipants) {
     console.log(`[lk-rec] Existing participant: ${participant.identity} (${participant.trackPublications.size} tracks)`);
     for (const [, pub] of participant.trackPublications) {
-      console.log(`[lk-rec] Existing track: kind=${pub.kind} subscribed=${pub.subscribed} muted=${pub.muted} hasTrack=${!!pub.track}`);
+      console.log(`[lk-rec] Existing track: kind=${pub.kind} subscribed=${pub.subscribed} muted=${pub.muted} hasTrack=${!!pub.track} sid=${pub.sid}`);
       if (!pub.subscribed) {
         try { pub.setSubscribed(true); console.log(`[lk-rec] Called setSubscribed(true) on ${pub.sid}`); }
         catch (e) { console.warn('[lk-rec] setSubscribed error:', e.message); }
@@ -536,6 +542,40 @@ async function main() {
       }
     }
   }
+
+  // Safety net: after 5 seconds, if audio capture still hasn't started, force-start it
+  // from any available pre-existing audio track. This handles the case where TrackSubscribed
+  // fires asynchronously after our initial scan and we need to wait for it.
+  setTimeout(() => {
+    if (stopping) return;
+    if (!audioStream) {
+      console.warn('[lk-rec] SAFETY NET: Audio capture not started after 5s — scanning for audio track...');
+      for (const [, participant] of room.remoteParticipants) {
+        for (const [, pub] of participant.trackPublications) {
+          if (pub.track && pub.track.kind === TrackKind.KIND_AUDIO && !audioStream) {
+            console.warn(`[lk-rec] SAFETY NET: Force-starting audio capture from ${participant.identity}`);
+            startAudioCapture(pub.track);
+          }
+        }
+      }
+      if (!audioStream) {
+        console.warn('[lk-rec] SAFETY NET: No audio track found after 5s — audio will be missing from recording');
+      }
+    } else {
+      console.log(`[lk-rec] Audio capture confirmed running after 5s (${audioFrameCount} frames so far)`);
+    }
+    if (!videoStream) {
+      console.warn('[lk-rec] SAFETY NET: Video capture not started after 5s — scanning for video track...');
+      for (const [, participant] of room.remoteParticipants) {
+        for (const [, pub] of participant.trackPublications) {
+          if (pub.track && pub.track.kind === TrackKind.KIND_VIDEO && !videoStream) {
+            console.warn(`[lk-rec] SAFETY NET: Force-starting video capture from ${participant.identity}`);
+            startVideoCapture(pub.track);
+          }
+        }
+      }
+    }
+  }, 5000);
 
   // Listen on stdin for commands from recorder.py
   // Commands: ROLL_SEGMENT\n

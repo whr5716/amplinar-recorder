@@ -169,13 +169,13 @@ def _concat_segments_to_file(segment_paths: list, out_path: str) -> None:
     """Concatenate segment files into out_path using FFmpeg.
 
     Strategy:
-      1. Try fast stream-copy (-c copy) — works when all segments have identical
-         codec parameters (the common case).
-      2. If that fails (mismatched codec params), fall back to a full re-encode
-         with libx264/aac which handles any combination of inputs.
+      Always re-encode to H.264/AAC to ensure audio is preserved across all
+      segments regardless of source codec (LiveKit captures use Opus/H.264,
+      downloaded videos may use AAC/H.264 — stream-copy silently drops audio
+      when codec parameters differ between segments).
 
     Writes directly to out_path — no large in-memory buffers.
-    Raises RuntimeError if both passes fail.
+    Raises RuntimeError on failure.
     """
     if len(segment_paths) == 1:
         import shutil
@@ -188,29 +188,20 @@ def _concat_segments_to_file(segment_paths: list, out_path: str) -> None:
         list_path = listf.name
 
     try:
-        # Pass 1: fast stream-copy
+        # Re-encode to H.264/AAC — handles any mix of input codecs and ensures
+        # audio is present in every segment of the output.
         result = subprocess.run(
             ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
-             "-c", "copy", out_path],
+             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+             "-c:a", "aac", "-b:a", "128k",
+             "-movflags", "+faststart",
+             out_path],
             capture_output=True,
         )
         if result.returncode != 0:
-            logger.warning(f"[FFmpeg] stream-copy failed (will re-encode): {result.stderr.decode()[-300:]}")
-            # Pass 2: full re-encode
-            result2 = subprocess.run(
-                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
-                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                 "-c:a", "aac", "-b:a", "128k",
-                 "-movflags", "+faststart",
-                 out_path],
-                capture_output=True,
-            )
-            if result2.returncode != 0:
-                logger.error(f"[FFmpeg] re-encode failed: {result2.stderr.decode()[-500:]}")
-                raise RuntimeError(f"FFmpeg concat failed: {result2.stderr.decode()[-300:]}")
-            logger.info("[FFmpeg] concat completed via re-encode fallback")
-        else:
-            logger.info("[FFmpeg] concat completed via stream-copy")
+            logger.error(f"[FFmpeg] concat failed: {result.stderr.decode()[-500:]}")
+            raise RuntimeError(f"FFmpeg concat failed: {result.stderr.decode()[-300:]}")
+        logger.info("[FFmpeg] concat completed (re-encode H.264/AAC)")
     finally:
         try:
             os.unlink(list_path)

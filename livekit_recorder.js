@@ -291,23 +291,29 @@ function mergeSegment(vOut, aOut, mergedOut, idx) {
 
   let args;
   if (vExists && aExists) {
-    // Calculate audio head-start: how many seconds of audio arrived before the first video frame.
-    // If audio started before video (firstAudioMs < firstVideoMs), the audio file has extra
-    // content at the start that needs to be trimmed. We use -itsoffset on the audio input
-    // to tell FFmpeg to skip that many seconds from the start of the audio stream.
-    const audioHeadStartSec = (firstVideoMs > 0 && firstAudioMs > 0 && firstAudioMs < firstVideoMs)
-      ? (firstVideoMs - firstAudioMs) / 1000
-      : 0;
-    console.log(`[lk-rec] Seg${idx} merge: audioHeadStart=${audioHeadStartSec.toFixed(3)}s (audioMs=${firstAudioMs}, videoMs=${firstVideoMs})`);
-    if (audioHeadStartSec > 0.05) {
-      // Trim the audio head-start by seeking into the audio file before muxing
+    // Probe the video duration so we can cap the audio to exactly the same length.
+    // Audio always encodes a few extra seconds past video end (drain lag), which
+    // causes the audio to run ahead of the lip movements in the merged file.
+    let videoDurationSec = 0;
+    try {
+      const probe = spawnSync('ffprobe', [
+        '-v', 'quiet', '-show_entries', 'stream=duration',
+        '-select_streams', 'v', '-of', 'csv=p=0', vOut
+      ], { encoding: 'utf8', timeout: 10000 });
+      videoDurationSec = parseFloat((probe.stdout || '').trim()) || 0;
+    } catch (_) {}
+    console.log(`[lk-rec] Seg${idx} merge: videoDuration=${videoDurationSec.toFixed(3)}s`);
+
+    if (videoDurationSec > 0) {
+      // Cap audio to video duration — this trims any tail audio that arrived after
+      // the last video frame, keeping A/V perfectly in sync.
       args = ['-y',
               '-i', vOut,
-              '-ss', audioHeadStartSec.toFixed(6), '-i', aOut,
+              '-i', aOut,
+              '-t', videoDurationSec.toFixed(6),
               '-c:v', 'copy', '-c:a', 'copy',
               '-movflags', '+faststart', mergedOut];
     } else {
-      // No meaningful offset — mux directly
       args = ['-y', '-i', vOut, '-i', aOut, '-c:v', 'copy', '-c:a', 'copy',
               '-movflags', '+faststart', mergedOut];
     }

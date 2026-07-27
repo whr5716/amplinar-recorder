@@ -136,6 +136,12 @@ let currentVideoOut = null;
 let currentAudioOut = null;
 let segmentRolling  = false;  // true while a roll is in progress
 
+// Audio pre-roll buffer: holds PCM chunks received before the first video frame.
+// Flushed into audioStdin the moment FFmpeg starts (triggered by first video frame).
+// This ensures audio and video start at exactly the same wall-clock moment.
+let audioPrebuffer  = [];     // Array<Buffer> — PCM chunks waiting for FFmpeg to start
+let ffmpegStarted   = false;  // true once startFFmpegSegment(0,...) has been called
+
 // ── Callback to recorder.py ───────────────────────────────────────────────────
 function notifySegmentComplete(videoPath, audioPath, segIdx) {
   if (!CALLBACK_URL) return;
@@ -347,21 +353,24 @@ function startVideoCapture(track) {
             actualWidth  = i420.width;
             actualHeight = i420.height;
             console.log(`[lk-rec] First video frame: ${actualWidth}x${actualHeight}`);
-            if (!videoStdin) {
-              // FFmpeg not yet started — start it now with the correct resolution
-              const { vProc, aProc, vOut, aOut } = startFFmpegSegment(0, actualWidth, actualHeight);
-              videoProc       = vProc;
-              audioProc       = aProc;
-              videoStdin      = vProc.stdin;
-              audioStdin      = aProc.stdin;
-              currentVideoOut = vOut;
-              currentAudioOut = aOut;
-              segmentStartMs  = Date.now();
-            } else {
-              // FFmpeg was already started by startAudioCapture (audio arrived first).
-              // The resolution may differ from the default — but we can't restart mid-stream.
-              // Log the actual resolution for reference.
-              console.log(`[lk-rec] FFmpeg already running (started by audio) — video resolution: ${actualWidth}x${actualHeight}`);
+            // Always start FFmpeg on first video frame — this is the sync point.
+            // Audio frames received before this moment are in audioPrebuffer and will
+            // be flushed immediately after FFmpeg starts, so A/V starts at the same time.
+            const { vProc, aProc, vOut, aOut } = startFFmpegSegment(0, actualWidth, actualHeight);
+            videoProc       = vProc;
+            audioProc       = aProc;
+            videoStdin      = vProc.stdin;
+            audioStdin      = aProc.stdin;
+            currentVideoOut = vOut;
+            currentAudioOut = aOut;
+            segmentStartMs  = Date.now();
+            ffmpegStarted   = true;
+            // Flush any audio that arrived before the first video frame.
+            // These frames are discarded (not written) because they predate the video.
+            // This keeps A/V in sync: both streams start from t=0 together.
+            if (audioPrebuffer.length > 0) {
+              console.log(`[lk-rec] Discarding ${audioPrebuffer.length} pre-video audio frames (sync alignment)`);
+              audioPrebuffer = [];
             }
             firstFrame = false;
           }
@@ -400,18 +409,12 @@ function startAudioCapture(track) {
   audioStream = new AudioStream(track, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS);
   const reader = audioStream.getReader();
 
-  // If FFmpeg hasn't started yet (no video track yet), start it now with default resolution.
-  // It will be restarted with the correct resolution when the first video frame arrives.
-  if (!audioStdin) {
-    console.log('[lk-rec] Audio track arrived before video — starting FFmpeg with default resolution');
-    const { vProc, aProc, vOut, aOut } = startFFmpegSegment(0, actualWidth, actualHeight);
-    videoProc       = vProc;
-    audioProc       = aProc;
-    videoStdin      = vProc.stdin;
-    audioStdin      = aProc.stdin;
-    currentVideoOut = vOut;
-    currentAudioOut = aOut;
-    segmentStartMs  = Date.now();
+  // NOTE: Do NOT start FFmpeg here even if audioStdin is null.
+  // Audio frames are buffered in audioPrebuffer until the first video frame arrives
+  // and triggers startFFmpegSegment(). This guarantees A/V sync: both streams start
+  // encoding from the exact same moment (the first video frame).
+  if (!ffmpegStarted) {
+    console.log('[lk-rec] Audio track ready — buffering PCM until first video frame (A/V sync)');
   }
 
   (async () => {
@@ -420,10 +423,19 @@ function startAudioCapture(track) {
         const { done, value: frame } = await reader.read();
         if (done || stopping) break;
         try {
-          if (!audioStdin || audioStdin.destroyed) continue;
           const buf = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
-          audioStdin.write(buf);
-          audioFrameCount++;
+          if (!ffmpegStarted) {
+            // FFmpeg not yet started — buffer this PCM chunk
+            audioPrebuffer.push(buf);
+            // Cap prebuffer at ~30s (30s * 48000 * 2 bytes * 1ch / ~960 bytes per frame ≈ 3000 frames)
+            if (audioPrebuffer.length > 3000) audioPrebuffer.shift();
+          } else {
+            // FFmpeg is running — write directly
+            if (audioStdin && !audioStdin.destroyed) {
+              audioStdin.write(buf);
+              audioFrameCount++;
+            }
+          }
         } catch (e) {
           if (!stopping) console.error('[lk-rec] Audio frame error:', e.message);
         }

@@ -336,13 +336,11 @@ function startVideoCapture(track) {
             segmentStartMs = Date.now();
             ffmpegStarted  = true;
 
-            // Flush any audio that was buffered while waiting for the first video frame.
-            // Because FFmpeg is now running, these frames go in at t=0 alongside video.
+            // Discard any audio buffered before the first video frame.
+            // Those frames represent audio that played BEFORE the video stream started —
+            // flushing them into FFmpeg would push audio ~23s ahead of the lips.
             if (audioPrebuffer.length > 0) {
-              console.log(`[lk-rec] Flushing ${audioPrebuffer.length} pre-buffered audio frames into FFmpeg`);
-              for (const buf of audioPrebuffer) {
-                writeAudioFrame(buf);
-              }
+              console.log(`[lk-rec] Discarding ${audioPrebuffer.length} pre-video audio frames (A/V sync)`);
               audioPrebuffer = [];
             }
 

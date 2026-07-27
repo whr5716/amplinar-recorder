@@ -384,9 +384,10 @@ function startVideoCapture(track) {
       try { reader.releaseLock(); } catch (_) {}
     }
     console.log(`[lk-rec] Video capture ended (${videoFrameCount} frames)`);
-    // Close BOTH pipes when video ends — this stops the audio tail and signals
-    // FFmpeg to finalize the file.  Audio keeps encoding after video ends otherwise,
-    // producing a 20+ second silent audio tail that desynchronizes the streams.
+    // Signal the audio loop to stop — without this it keeps running and encodes
+    // 20+ seconds of silent audio after the video ends.
+    stopping = true;
+    // Close BOTH pipes to signal EOF to FFmpeg
     try { if (videoPipe && !videoPipe.destroyed) videoPipe.end(); } catch (_) {}
     try { if (audioPipe && !audioPipe.destroyed) audioPipe.end(); } catch (_) {}
     console.log('[lk-rec] Both pipes closed — FFmpeg will finalize');

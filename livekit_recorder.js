@@ -399,7 +399,15 @@ function startAudioCapture(track) {
         const { done, value: frame } = await reader.read();
         if (done || stopping) break;
         try {
-          if (!audioStdin || audioStdin.destroyed) continue;
+          // Wait up to 5s for audioStdin to become available (set when first video frame arrives)
+          if (!audioStdin || audioStdin.destroyed) {
+            let waited = 0;
+            while ((!audioStdin || audioStdin.destroyed) && !stopping && waited < 5000) {
+              await new Promise(r => setTimeout(r, 50));
+              waited += 50;
+            }
+            if (!audioStdin || audioStdin.destroyed) continue;
+          }
           const buf = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
           audioStdin.write(buf);
           audioFrameCount++;
@@ -494,14 +502,24 @@ async function main() {
   await room.connect(LK_URL, LK_TOKEN, { autoSubscribe: true });
   console.log(`[lk-rec] Connected to room: ${room.name}, participants: ${room.remoteParticipants.size}`);
 
-  // Subscribe to any existing unsubscribed tracks
+  // Subscribe to any existing unsubscribed tracks, and start capture for already-subscribed ones
+  // (TrackSubscribed events for pre-existing tracks may have fired before our handler was registered)
   for (const [, participant] of room.remoteParticipants) {
     console.log(`[lk-rec] Existing participant: ${participant.identity} (${participant.trackPublications.size} tracks)`);
     for (const [, pub] of participant.trackPublications) {
-      console.log(`[lk-rec] Existing track: kind=${pub.kind} subscribed=${pub.subscribed} muted=${pub.muted}`);
+      console.log(`[lk-rec] Existing track: kind=${pub.kind} subscribed=${pub.subscribed} muted=${pub.muted} hasTrack=${!!pub.track}`);
       if (!pub.subscribed) {
         try { pub.setSubscribed(true); console.log(`[lk-rec] Called setSubscribed(true) on ${pub.sid}`); }
         catch (e) { console.warn('[lk-rec] setSubscribed error:', e.message); }
+      } else if (pub.track) {
+        // Already subscribed — start capture if not already started (may have been missed)
+        if (pub.track.kind === TrackKind.KIND_VIDEO && !videoStream) {
+          console.log(`[lk-rec] Starting video capture for pre-existing track from ${participant.identity}`);
+          startVideoCapture(pub.track);
+        } else if (pub.track.kind === TrackKind.KIND_AUDIO && !audioStream) {
+          console.log(`[lk-rec] Starting audio capture for pre-existing track from ${participant.identity}`);
+          startAudioCapture(pub.track);
+        }
       }
     }
   }

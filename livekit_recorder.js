@@ -1,16 +1,13 @@
-'use strict';
 
 /**
- * livekit_recorder.js  (v6 — MP4 output, rolling segments, crash-safe)
+ * livekit_recorder.js  (v7 — single-FFmpeg A/V sync)
  * =========================================================
  * Connects to a LiveKit room, captures avatar video + audio, and writes
- * rolling MP4 segments (H.264/AAC).  Each segment is:
- *   1. Written via a streaming FFmpeg pipeline (crash-safe — partial file
- *      is always a valid WebM)
- *   2. Uploaded to S3 immediately on completion via a callback to recorder.py
+ * rolling MP4 segments (H.264/AAC).
  *
- * If this process crashes, Railway restarts it automatically.  The new
- * instance starts a new segment — all previous segments are already in S3.
+ * KEY DESIGN: A single FFmpeg process receives BOTH video (pipe:3) and
+ * audio (pipe:4) simultaneously.  Because both streams share one FFmpeg
+ * clock from the very first frame, there is no A/V sync drift.
  *
  * Usage:
  *   node livekit_recorder.js <lk_url> <lk_room> <output_path>
@@ -36,7 +33,7 @@ const {
 
 const { AccessToken } = require('livekit-server-sdk');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
-const { spawn, spawnSync } = require('child_process');
+const { spawn } = require('child_process');
 const fs   = require('fs');
 const http = require('http');
 const https = require('https');
@@ -88,7 +85,7 @@ if (!LK_URL || !LK_ROOM || !OUTPUT_PATH) {
   process.exit(1);
 }
 
-const SEGMENT_MINUTES = parseInt(flags['segment-minutes'] || '0', 10);  // 0 = no rolling
+const SEGMENT_MINUTES = parseInt(flags['segment-minutes'] || '0', 10);
 const CALLBACK_URL    = flags['callback-url'] || '';
 const CALLBACK_KEY    = flags['callback-key'] || '';
 const SESSION_ID      = flags['session-id']   || '';
@@ -128,33 +125,29 @@ let actualHeight    = 720;
 // Current segment state
 let segmentIndex    = 0;
 let segmentStartMs  = 0;
-let videoProc       = null;
-let audioProc       = null;
-let videoStdin      = null;
-let audioStdin      = null;
-let currentVideoOut = null;
-let currentAudioOut = null;
-let segmentRolling  = false;  // true while a roll is in progress
+let segmentRolling  = false;
 
-// Audio pre-roll buffer: holds PCM chunks received before the first video frame.
-let audioPrebuffer      = [];     // Array<Buffer> — PCM chunks waiting for FFmpeg to start
-let ffmpegStarted       = false;  // true once startFFmpegSegment(0,...) has been called
+// Single FFmpeg process — receives video on pipe:3, audio on pipe:4
+let ffmpegProc      = null;    // the spawned process
+let videoPipe       = null;    // ffmpegProc.stdio[3]
+let audioPipe       = null;    // ffmpegProc.stdio[4]
+let currentOut      = null;    // output MP4 path for current segment
+let ffmpegStarted   = false;   // true once FFmpeg has been spawned
 
-// Sync timestamps — wall-clock ms when the first frame of each type arrived.
-// The difference (audioStartMs - videoStartMs) is the audio head-start that
-// causes lip-sync offset. We pass it as -itsoffset to FFmpeg at merge time.
-let firstAudioMs        = 0;   // Date.now() when first audio frame arrived
-let firstVideoMs        = 0;   // Date.now() when first video frame arrived (= FFmpeg start)
+// Audio pre-roll buffer — holds PCM chunks that arrive before the first video
+// frame triggers FFmpeg start.  Flushed immediately when FFmpeg starts so
+// audio and video begin encoding at exactly the same moment.
+let audioPrebuffer  = [];      // Array<Buffer>
 
 // ── Callback to recorder.py ───────────────────────────────────────────────────
-function notifySegmentComplete(videoPath, audioPath, segIdx) {
+function notifySegmentComplete(mergedPath, s3Url, segIdx) {
   if (!CALLBACK_URL) return;
   const body = JSON.stringify({
-    session_id:   SESSION_ID,
-    amplinar_id:  AMPLINAR_ID,
+    session_id:    SESSION_ID,
+    amplinar_id:   AMPLINAR_ID,
     segment_index: segIdx,
-    video_path:   videoPath || '',
-    audio_path:   audioPath || '',
+    video_path:    mergedPath || '',
+    audio_path:    s3Url || '',
   });
   const url = new URL(CALLBACK_URL);
   const lib = url.protocol === 'https:' ? https : http;
@@ -176,78 +169,90 @@ function notifySegmentComplete(videoPath, audioPath, segIdx) {
   req.end();
 }
 
-// ── FFmpeg segment management ─────────────────────────────────────────────────
-function segmentPath(idx, suffix) {
+// ── Segment path helper ───────────────────────────────────────────────────────
+function segmentPath(idx) {
   const dir  = path.dirname(OUTPUT_PATH);
   const base = path.basename(OUTPUT_PATH, path.extname(OUTPUT_PATH));
-  return path.join(dir, `${base}_seg${String(idx).padStart(3,'0')}${suffix}`);
+  return path.join(dir, `${base}_seg${String(idx).padStart(3,'0')}.mp4`);
 }
 
+// ── Start a single FFmpeg process for one segment ─────────────────────────────
+// Video arrives on pipe:3 (raw YUV420p), audio arrives on pipe:4 (raw s16le PCM).
+// FFmpeg muxes both on a shared clock and writes directly to an MP4 file.
 function startFFmpegSegment(idx, width, height) {
-  const vOut = segmentPath(idx, '_video.mp4');
-  const aOut = segmentPath(idx, '_audio.aac');
+  const outPath = segmentPath(idx);
+  console.log(`[lk-rec] Starting FFmpeg segment ${idx}: ${outPath} (${width}x${height})`);
 
-  console.log(`[lk-rec] Starting FFmpeg segment ${idx}: ${vOut}`);
-
-  // H.264 video — ultrafast preset for real-time encoding
-  const vProc = spawn('ffmpeg', [
+  const proc = spawn('ffmpeg', [
     '-y',
+    // Video input on pipe:3
     '-f', 'rawvideo', '-pix_fmt', 'yuv420p',
     '-s', `${width}x${height}`,
     '-r', String(VIDEO_FPS),
-    '-i', 'pipe:0',
-    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-    '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
-    '-an', vOut,
-  ], { stdio: ['pipe', 'inherit', 'inherit'] });
-
-  vProc.on('exit', (code) => console.log(`[lk-rec] FFmpeg video seg${idx} exited (code=${code})`));
-
-  // AAC audio
-  const aProc = spawn('ffmpeg', [
-    '-y',
+    '-thread_queue_size', '512',
+    '-i', 'pipe:3',
+    // Audio input on pipe:4
     '-f', 's16le', '-ar', String(AUDIO_SAMPLE_RATE), '-ac', String(AUDIO_CHANNELS),
-    '-i', 'pipe:0',
+    '-thread_queue_size', '512',
+    '-i', 'pipe:4',
+    // Video encoding
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+    // Audio encoding
     '-c:a', 'aac', '-b:a', '128k',
-    aOut,
-  ], { stdio: ['pipe', 'inherit', 'inherit'] });
+    // Output
+    '-movflags', '+faststart',
+    outPath,
+  ], {
+    // stdin=ignore, stdout=pipe, stderr=pipe, pipe:3=pipe, pipe:4=pipe
+    stdio: ['ignore', 'inherit', 'inherit', 'pipe', 'pipe'],
+  });
 
-  aProc.on('exit', (code) => console.log(`[lk-rec] FFmpeg audio seg${idx} exited (code=${code})`));
+  proc.stdio[3].on('error', (e) => { if (!stopping) console.error('[lk-rec] Video pipe error:', e.message); });
+  proc.stdio[4].on('error', (e) => { if (!stopping) console.error('[lk-rec] Audio pipe error:', e.message); });
+  proc.on('exit', (code) => console.log(`[lk-rec] FFmpeg seg${idx} exited (code=${code})`));
+  proc.on('error', (e) => console.error('[lk-rec] FFmpeg spawn error:', e.message));
 
-  return { vProc, aProc, vOut, aOut };
+  return { proc, outPath };
 }
 
-function closeFFmpegSegment(vProc, aProc, vOut, aOut, idx) {
-  return new Promise((resolve) => {
-    let vDone = false, aDone = false;
-    const check = () => { if (vDone && aDone) resolve(); };
+// ── Upload and notify after a segment file is complete ────────────────────────
+function finaliseSegment(outPath, idx) {
+  const sz = fs.existsSync(outPath) ? fs.statSync(outPath).size : 0;
+  console.log(`[lk-rec] Segment ${idx} complete: ${outPath} (${sz} bytes)`);
+  if (sz === 0) {
+    console.warn(`[lk-rec] Segment ${idx}: empty file — skipping upload`);
+    return;
+  }
+  uploadToS3(outPath, idx)
+    .then(url => {
+      notifySegmentComplete(outPath, url, idx);
+      try { fs.unlinkSync(outPath); } catch (_) {}
+    })
+    .catch(e => {
+      console.error(`[lk-rec] S3 upload failed for seg${idx}: ${e.message}`);
+      notifySegmentComplete(outPath, '', idx);
+    });
+}
 
-    if (vProc && !vProc.stdin.destroyed) {
-      vProc.stdin.end();
-    }
-    if (aProc && !aProc.stdin.destroyed) {
-      aProc.stdin.end();
-    }
+// ── Close FFmpeg and wait for it to finish writing ────────────────────────────
+function closeFFmpegSegment(proc, idx) {
+  return new Promise((resolve) => {
+    if (!proc) { resolve(); return; }
 
     const timeout = setTimeout(() => {
       console.warn(`[lk-rec] FFmpeg seg${idx} close timeout — killing`);
-      try { vProc && vProc.kill(); } catch (_) {}
-      try { aProc && aProc.kill(); } catch (_) {}
+      try { proc.kill(); } catch (_) {}
       resolve();
-    }, 10000);
+    }, 15000);
 
-    if (vProc) {
-      vProc.once('exit', () => { vDone = true; check(); });
-    } else { vDone = true; }
+    proc.once('exit', () => {
+      clearTimeout(timeout);
+      resolve();
+    });
 
-    if (aProc) {
-      aProc.once('exit', () => { aDone = true; check(); });
-    } else { aDone = true; }
-
-    check();
-    // Clear timeout once resolved
-    const origResolve = resolve;
-    resolve = (...args) => { clearTimeout(timeout); origResolve(...args); };
+    // Close both input pipes to signal EOF to FFmpeg
+    try { if (proc.stdio[3] && !proc.stdio[3].destroyed) proc.stdio[3].end(); } catch (_) {}
+    try { if (proc.stdio[4] && !proc.stdio[4].destroyed) proc.stdio[4].end(); } catch (_) {}
   });
 }
 
@@ -256,106 +261,47 @@ async function rollSegment() {
   if (segmentRolling) return;
   segmentRolling = true;
 
-  const oldIdx      = segmentIndex;
-  const oldVProc    = videoProc;
-  const oldAProc    = audioProc;
-  const oldVOut     = currentVideoOut;
-  const oldAOut     = currentAudioOut;
+  const oldIdx  = segmentIndex;
+  const oldProc = ffmpegProc;
+  const oldOut  = currentOut;
 
   // Start new segment immediately so we don't drop frames
   segmentIndex++;
-  const { vProc, aProc, vOut, aOut } = startFFmpegSegment(segmentIndex, actualWidth, actualHeight);
-  videoProc       = vProc;
-  audioProc       = aProc;
-  videoStdin      = vProc.stdin;
-  audioStdin      = aProc.stdin;
-  currentVideoOut = vOut;
-  currentAudioOut = aOut;
-  segmentStartMs  = Date.now();
+  const { proc, outPath } = startFFmpegSegment(segmentIndex, actualWidth, actualHeight);
+  ffmpegProc    = proc;
+  videoPipe     = proc.stdio[3];
+  audioPipe     = proc.stdio[4];
+  currentOut    = outPath;
+  segmentStartMs = Date.now();
 
   console.log(`[lk-rec] Rolled to segment ${segmentIndex}`);
 
-  // Close old segment and notify callback
-  await closeFFmpegSegment(oldVProc, oldAProc, oldVOut, oldAOut, oldIdx);
-
-  // Merge old segment and notify
-  const mergedOut = segmentPath(oldIdx, '.mp4');
-  mergeSegment(oldVOut, oldAOut, mergedOut, oldIdx);
+  // Close old segment, then upload
+  await closeFFmpegSegment(oldProc, oldIdx);
+  finaliseSegment(oldOut, oldIdx);
 
   segmentRolling = false;
 }
 
-function mergeSegment(vOut, aOut, mergedOut, idx) {
-  const vExists = vOut && fs.existsSync(vOut) && fs.statSync(vOut).size > 0;
-  const aExists = aOut && fs.existsSync(aOut) && fs.statSync(aOut).size > 0;
-
-  let args;
-  if (vExists && aExists) {
-    // Probe the video duration so we can cap the audio to exactly the same length.
-    // Audio always encodes a few extra seconds past video end (drain lag), which
-    // causes the audio to run ahead of the lip movements in the merged file.
-    let videoDurationSec = 0;
-    try {
-      const probe = spawnSync('ffprobe', [
-        '-v', 'quiet', '-show_entries', 'stream=duration',
-        '-select_streams', 'v', '-of', 'csv=p=0', vOut
-      ], { encoding: 'utf8', timeout: 10000 });
-      videoDurationSec = parseFloat((probe.stdout || '').trim()) || 0;
-    } catch (_) {}
-    console.log(`[lk-rec] Seg${idx} merge: videoDuration=${videoDurationSec.toFixed(3)}s`);
-
-    if (videoDurationSec > 0) {
-      // Cap audio to video duration — this trims any tail audio that arrived after
-      // the last video frame, keeping A/V perfectly in sync.
-      args = ['-y',
-              '-i', vOut,
-              '-i', aOut,
-              '-t', videoDurationSec.toFixed(6),
-              '-c:v', 'copy', '-c:a', 'copy',
-              '-movflags', '+faststart', mergedOut];
-    } else {
-      args = ['-y', '-i', vOut, '-i', aOut, '-c:v', 'copy', '-c:a', 'copy',
-              '-movflags', '+faststart', mergedOut];
-    }
-  } else if (vExists) {
-    args = ['-y', '-i', vOut, '-c', 'copy', '-movflags', '+faststart', mergedOut];
-  } else if (aExists) {
-    args = ['-y', '-i', aOut, '-c', 'copy', mergedOut];
-  } else {
-    console.warn(`[lk-rec] Segment ${idx}: no video or audio output — skipping`);
-    return;
+// ── Write video frame to FFmpeg ───────────────────────────────────────────────
+function writeVideoFrame(yBuf, uBuf, vBuf) {
+  if (!videoPipe || videoPipe.destroyed) return;
+  try {
+    videoPipe.write(yBuf);
+    videoPipe.write(uBuf);
+    videoPipe.write(vBuf);
+  } catch (e) {
+    if (!stopping) console.error('[lk-rec] writeVideoFrame error:', e.message);
   }
+}
 
-  const result = spawnSync('ffmpeg', args, { stdio: 'inherit', timeout: 60000 });
-  if (result.status !== 0) {
-    console.error(`[lk-rec] Segment ${idx} merge failed (code=${result.status})`);
-    // Fall back to video-only if merge failed
-    if (vExists) {
-      try { fs.copyFileSync(vOut, mergedOut); } catch (_) {}
-    }
-  }
-
-  // Clean up intermediate files
-  try { if (vOut) fs.unlinkSync(vOut); } catch (_) {}
-  try { if (aOut) fs.unlinkSync(aOut); } catch (_) {}
-
-  const sz = fs.existsSync(mergedOut) ? fs.statSync(mergedOut).size : 0;
-  console.log(`[lk-rec] Segment ${idx} merged: ${mergedOut} (${sz} bytes)`);
-
-  if (sz > 0) {
-    // Upload directly to S3 from Node.js — does NOT depend on recorder.py being alive
-    uploadToS3(mergedOut, idx)
-      .then(url => {
-        // Also notify recorder.py so it can store the URL in the DB
-        notifySegmentComplete(mergedOut, url, idx);
-        // Clean up local file after successful upload
-        try { fs.unlinkSync(mergedOut); } catch (_) {}
-      })
-      .catch(e => {
-        console.error(`[lk-rec] S3 upload failed for seg${idx}: ${e.message}`);
-        // Still notify recorder.py with local path as fallback
-        notifySegmentComplete(mergedOut, '', idx);
-      });
+// ── Write audio frame to FFmpeg ───────────────────────────────────────────────
+function writeAudioFrame(buf) {
+  if (!audioPipe || audioPipe.destroyed) return;
+  try {
+    audioPipe.write(buf);
+  } catch (e) {
+    if (!stopping) console.error('[lk-rec] writeAudioFrame error:', e.message);
   }
 }
 
@@ -379,39 +325,46 @@ function startVideoCapture(track) {
           if (firstFrame) {
             actualWidth  = i420.width;
             actualHeight = i420.height;
-            firstVideoMs = Date.now();
-            console.log(`[lk-rec] First video frame: ${actualWidth}x${actualHeight} at t=${firstVideoMs}`);
-            const { vProc, aProc, vOut, aOut } = startFFmpegSegment(0, actualWidth, actualHeight);
-            videoProc       = vProc;
-            audioProc       = aProc;
-            videoStdin      = vProc.stdin;
-            audioStdin      = aProc.stdin;
-            currentVideoOut = vOut;
-            currentAudioOut = aOut;
-            segmentStartMs  = firstVideoMs;
-            ffmpegStarted   = true;
-            // Discard any audio buffered before the first video frame — those frames
-            // predate the video and would cause audio to run ahead of the lips.
+            console.log(`[lk-rec] First video frame: ${actualWidth}x${actualHeight} — starting FFmpeg`);
+
+            // Start single FFmpeg process with both video and audio inputs
+            const { proc, outPath } = startFFmpegSegment(0, actualWidth, actualHeight);
+            ffmpegProc    = proc;
+            videoPipe     = proc.stdio[3];
+            audioPipe     = proc.stdio[4];
+            currentOut    = outPath;
+            segmentStartMs = Date.now();
+            ffmpegStarted  = true;
+
+            // Flush any audio that was buffered while waiting for the first video frame.
+            // Because FFmpeg is now running, these frames go in at t=0 alongside video.
             if (audioPrebuffer.length > 0) {
-              console.log(`[lk-rec] Discarding ${audioPrebuffer.length} pre-video audio frames`);
+              console.log(`[lk-rec] Flushing ${audioPrebuffer.length} pre-buffered audio frames into FFmpeg`);
+              for (const buf of audioPrebuffer) {
+                writeAudioFrame(buf);
+              }
               audioPrebuffer = [];
             }
+
             firstFrame = false;
           }
 
-          if (!videoStdin || videoStdin.destroyed) continue;
+          if (!videoPipe || videoPipe.destroyed) continue;
 
           const yPlane = i420.getPlane(0);
           const uPlane = i420.getPlane(1);
           const vPlane = i420.getPlane(2);
           if (yPlane && uPlane && vPlane) {
-            videoStdin.write(Buffer.from(yPlane));
-            videoStdin.write(Buffer.from(uPlane));
-            videoStdin.write(Buffer.from(vPlane));
+            writeVideoFrame(Buffer.from(yPlane), Buffer.from(uPlane), Buffer.from(vPlane));
             videoFrameCount++;
             if (videoFrameCount % 300 === 0) {
               console.log(`[lk-rec] Video frames: ${videoFrameCount} (${actualWidth}x${actualHeight})`);
             }
+          }
+
+          // Roll segment if needed
+          if (SEGMENT_MS > 0 && !segmentRolling && (Date.now() - segmentStartMs) >= SEGMENT_MS) {
+            rollSegment();
           }
         } catch (e) {
           if (!stopping) console.error('[lk-rec] Video frame error:', e.message);
@@ -423,7 +376,8 @@ function startVideoCapture(track) {
       try { reader.releaseLock(); } catch (_) {}
     }
     console.log(`[lk-rec] Video capture ended (${videoFrameCount} frames)`);
-    if (videoStdin && !videoStdin.destroyed) { try { videoStdin.end(); } catch (_) {} }
+    // Close video pipe — FFmpeg will finish encoding when audio pipe also closes
+    try { if (videoPipe && !videoPipe.destroyed) videoPipe.end(); } catch (_) {}
   })();
 }
 
@@ -433,12 +387,8 @@ function startAudioCapture(track) {
   audioStream = new AudioStream(track, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS);
   const reader = audioStream.getReader();
 
-  // NOTE: Do NOT start FFmpeg here even if audioStdin is null.
-  // Audio frames are buffered in audioPrebuffer until the first video frame arrives
-  // and triggers startFFmpegSegment(). This guarantees A/V sync: both streams start
-  // encoding from the exact same moment (the first video frame).
   if (!ffmpegStarted) {
-    console.log('[lk-rec] Audio track ready — buffering PCM until first video frame (A/V sync)');
+    console.log('[lk-rec] Audio track ready — buffering PCM until first video frame starts FFmpeg');
   }
 
   (async () => {
@@ -449,19 +399,12 @@ function startAudioCapture(track) {
         try {
           const buf = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
           if (!ffmpegStarted) {
-            // FFmpeg not yet started — buffer this PCM chunk and record when audio first arrived
-            if (firstAudioMs === 0) {
-              firstAudioMs = Date.now();
-              console.log(`[lk-rec] First audio frame at t=${firstAudioMs}`);
-            }
+            // FFmpeg not yet started — buffer until video frame triggers it
             audioPrebuffer.push(buf);
             if (audioPrebuffer.length > 3000) audioPrebuffer.shift();
           } else {
-            // FFmpeg is running — write directly
-            if (audioStdin && !audioStdin.destroyed) {
-              audioStdin.write(buf);
-              audioFrameCount++;
-            }
+            writeAudioFrame(buf);
+            audioFrameCount++;
           }
         } catch (e) {
           if (!stopping) console.error('[lk-rec] Audio frame error:', e.message);
@@ -473,7 +416,8 @@ function startAudioCapture(track) {
       try { reader.releaseLock(); } catch (_) {}
     }
     console.log(`[lk-rec] Audio capture ended (${audioFrameCount} frames)`);
-    if (audioStdin && !audioStdin.destroyed) { try { audioStdin.end(); } catch (_) {} }
+    // Close audio pipe — FFmpeg will finish encoding once both pipes are closed
+    try { if (audioPipe && !audioPipe.destroyed) audioPipe.end(); } catch (_) {}
   })();
 }
 
@@ -484,17 +428,15 @@ async function gracefulStop() {
 
   console.log('[lk-rec] Stopping capture...');
 
-  // Signal reader loops to exit — they check stopping at each iteration
-  // and will call videoStdin.end() / audioStdin.end() when they exit.
-  // Wait for them to drain.
+  // Give reader loops time to drain their last frames
   await new Promise(r => setTimeout(r, 3000));
 
-  // Force-close stdin pipes (belt-and-suspenders)
-  if (videoStdin && !videoStdin.destroyed) { try { videoStdin.end(); } catch (_) {} }
-  if (audioStdin && !audioStdin.destroyed) { try { audioStdin.end(); } catch (_) {} }
+  // Force-close both pipes to signal EOF to FFmpeg
+  try { if (videoPipe && !videoPipe.destroyed) videoPipe.end(); } catch (_) {}
+  try { if (audioPipe && !audioPipe.destroyed) audioPipe.end(); } catch (_) {}
 
-  // Wait for FFmpeg to finalise the current segment
-  await new Promise(r => setTimeout(r, 5000));
+  // Wait for FFmpeg to finish writing the file
+  await closeFFmpegSegment(ffmpegProc, segmentIndex);
 
   // Disconnect from room
   if (room) { try { await room.disconnect(); } catch (_) {} }
@@ -506,9 +448,11 @@ async function gracefulStop() {
     process.exit(1);
   }
 
-  // Merge and notify the final segment
-  const finalMerged = segmentPath(segmentIndex, '.mp4');
-  mergeSegment(currentVideoOut, currentAudioOut, finalMerged, segmentIndex);
+  // Upload the final segment
+  finaliseSegment(currentOut, segmentIndex);
+
+  // Give the async upload a moment to start before exiting
+  await new Promise(r => setTimeout(r, 2000));
 
   process.exit(0);
 }
@@ -523,15 +467,14 @@ async function main() {
   room = new Room();
 
   room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
-    console.log(`[lk-rec] TrackSubscribed: kind=${track.kind} (${track.kind === TrackKind.KIND_AUDIO ? 'AUDIO' : track.kind === TrackKind.KIND_VIDEO ? 'VIDEO' : 'UNKNOWN'}) from ${participant.identity} sid=${track.sid}`);
+    const kindName = track.kind === TrackKind.KIND_AUDIO ? 'AUDIO' : track.kind === TrackKind.KIND_VIDEO ? 'VIDEO' : 'UNKNOWN';
+    console.log(`[lk-rec] TrackSubscribed: kind=${kindName} from ${participant.identity} sid=${track.sid}`);
     if (track.kind === TrackKind.KIND_VIDEO && !videoStream) {
-      console.log('[lk-rec] → Starting video capture from TrackSubscribed');
+      console.log('[lk-rec] → Starting video capture');
       startVideoCapture(track);
     } else if (track.kind === TrackKind.KIND_AUDIO && !audioStream) {
-      console.log('[lk-rec] → Starting audio capture from TrackSubscribed');
+      console.log('[lk-rec] → Starting audio capture');
       startAudioCapture(track);
-    } else {
-      console.log(`[lk-rec] → Skipping track: videoStream=${!!videoStream} audioStream=${!!audioStream}`);
     }
   });
 
@@ -557,67 +500,45 @@ async function main() {
 
   await room.connect(LK_URL, LK_TOKEN, { autoSubscribe: true });
   console.log(`[lk-rec] Connected to room: ${room.name}, participants: ${room.remoteParticipants.size}`);
-  console.log(`[lk-rec] autoSubscribe=true — TrackSubscribed events will fire for all tracks`);
 
-  // Subscribe to any existing unsubscribed tracks, and start capture for already-subscribed ones
-  // (TrackSubscribed events for pre-existing tracks may have fired before our handler was registered)
-  console.log(`[lk-rec] Scanning ${room.remoteParticipants.size} existing participant(s) for tracks...`);
+  // Subscribe to any existing unsubscribed tracks
   for (const [, participant] of room.remoteParticipants) {
     console.log(`[lk-rec] Existing participant: ${participant.identity} (${participant.trackPublications.size} tracks)`);
     for (const [, pub] of participant.trackPublications) {
-      console.log(`[lk-rec] Existing track: kind=${pub.kind} subscribed=${pub.subscribed} muted=${pub.muted} hasTrack=${!!pub.track} sid=${pub.sid}`);
+      console.log(`[lk-rec] Existing track: kind=${pub.kind} subscribed=${pub.subscribed} hasTrack=${!!pub.track}`);
       if (!pub.subscribed) {
-        try { pub.setSubscribed(true); console.log(`[lk-rec] Called setSubscribed(true) on ${pub.sid}`); }
-        catch (e) { console.warn('[lk-rec] setSubscribed error:', e.message); }
+        try { pub.setSubscribed(true); } catch (e) { console.warn('[lk-rec] setSubscribed error:', e.message); }
       } else if (pub.track) {
-        // Already subscribed — start capture if not already started (may have been missed)
         if (pub.track.kind === TrackKind.KIND_VIDEO && !videoStream) {
-          console.log(`[lk-rec] Starting video capture for pre-existing track from ${participant.identity}`);
+          console.log(`[lk-rec] Starting video capture for pre-existing track`);
           startVideoCapture(pub.track);
         } else if (pub.track.kind === TrackKind.KIND_AUDIO && !audioStream) {
-          console.log(`[lk-rec] Starting audio capture for pre-existing track from ${participant.identity}`);
+          console.log(`[lk-rec] Starting audio capture for pre-existing track`);
           startAudioCapture(pub.track);
         }
       }
     }
   }
 
-  // Safety net: after 5 seconds, if audio capture still hasn't started, force-start it
-  // from any available pre-existing audio track. This handles the case where TrackSubscribed
-  // fires asynchronously after our initial scan and we need to wait for it.
+  // Safety net: after 5 seconds, force-start any missing capture
   setTimeout(() => {
     if (stopping) return;
-    if (!audioStream) {
-      console.warn('[lk-rec] SAFETY NET: Audio capture not started after 5s — scanning for audio track...');
-      for (const [, participant] of room.remoteParticipants) {
-        for (const [, pub] of participant.trackPublications) {
-          if (pub.track && pub.track.kind === TrackKind.KIND_AUDIO && !audioStream) {
-            console.warn(`[lk-rec] SAFETY NET: Force-starting audio capture from ${participant.identity}`);
-            startAudioCapture(pub.track);
-          }
+    for (const [, participant] of room.remoteParticipants) {
+      for (const [, pub] of participant.trackPublications) {
+        if (pub.track && pub.track.kind === TrackKind.KIND_VIDEO && !videoStream) {
+          console.warn(`[lk-rec] SAFETY NET: Force-starting video capture from ${participant.identity}`);
+          startVideoCapture(pub.track);
         }
-      }
-      if (!audioStream) {
-        console.warn('[lk-rec] SAFETY NET: No audio track found after 5s — audio will be missing from recording');
-      }
-    } else {
-      console.log(`[lk-rec] Audio capture confirmed running after 5s (${audioFrameCount} frames so far)`);
-    }
-    if (!videoStream) {
-      console.warn('[lk-rec] SAFETY NET: Video capture not started after 5s — scanning for video track...');
-      for (const [, participant] of room.remoteParticipants) {
-        for (const [, pub] of participant.trackPublications) {
-          if (pub.track && pub.track.kind === TrackKind.KIND_VIDEO && !videoStream) {
-            console.warn(`[lk-rec] SAFETY NET: Force-starting video capture from ${participant.identity}`);
-            startVideoCapture(pub.track);
-          }
+        if (pub.track && pub.track.kind === TrackKind.KIND_AUDIO && !audioStream) {
+          console.warn(`[lk-rec] SAFETY NET: Force-starting audio capture from ${participant.identity}`);
+          startAudioCapture(pub.track);
         }
       }
     }
+    console.log(`[lk-rec] Status after 5s: video=${!!videoStream} audio=${!!audioStream} ffmpegStarted=${ffmpegStarted} videoFrames=${videoFrameCount} audioFrames=${audioFrameCount}`);
   }, 5000);
 
   // Listen on stdin for commands from recorder.py
-  // Commands: ROLL_SEGMENT\n
   process.stdin.setEncoding('utf8');
   let stdinBuf = '';
   process.stdin.on('data', (chunk) => {
@@ -648,7 +569,7 @@ async function main() {
 
 main().catch(e => {
   console.error('[lk-rec] Fatal:', e);
-  if (videoStdin && !videoStdin.destroyed) { try { videoStdin.end(); } catch (_) {} }
-  if (audioStdin && !audioStdin.destroyed) { try { audioStdin.end(); } catch (_) {} }
+  try { if (videoPipe && !videoPipe.destroyed) videoPipe.end(); } catch (_) {}
+  try { if (audioPipe && !audioPipe.destroyed) audioPipe.end(); } catch (_) {}
   process.exit(1);
 });

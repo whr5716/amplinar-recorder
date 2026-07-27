@@ -1,13 +1,15 @@
 
 /**
- * livekit_recorder.js  (v8 — video delay queue for A/V sync)
+ * livekit_recorder.js  (v9 — itsoffset A/V sync)
  * =========================================================
  * Connects to a LiveKit room, captures avatar video + audio, and writes
  * rolling MP4 segments (H.264/AAC).
  *
  * KEY DESIGN: A single FFmpeg process receives BOTH video (pipe:3) and
- * audio (pipe:4) simultaneously.  Because both streams share one FFmpeg
- * clock from the very first frame, there is no A/V sync drift.
+ * audio (pipe:4) simultaneously.  The avatar's audio arrives at the recorder
+ * ~1.2 seconds AFTER the video (network path difference).  We compensate by
+ * telling FFmpeg that the audio input starts 1.2 seconds into the timeline
+ * via -itsoffset, so the muxed output has video and audio perfectly aligned.
  *
  * Usage:
  *   node livekit_recorder.js <lk_url> <lk_room> <output_path>
@@ -104,6 +106,12 @@ const AUDIO_SAMPLE_RATE = 48000;
 const AUDIO_CHANNELS    = 1;
 const SEGMENT_MS        = SEGMENT_MINUTES > 0 ? SEGMENT_MINUTES * 60 * 1000 : 0;
 
+// A/V sync offset: the avatar's audio arrives at the recorder ~1.2 seconds
+// after the video due to network path differences.  We tell FFmpeg to place
+// the audio stream 1.2 seconds into the video timeline so lips and voice align.
+// Increase if audio is still behind; decrease if audio is ahead.
+const AUDIO_OFFSET_SECS = '1.2';
+
 // ── Token ─────────────────────────────────────────────────────────────────────
 async function makeToken(room) {
   const identity = `amplinar-recorder-${Date.now()}`;
@@ -135,17 +143,9 @@ let currentOut      = null;    // output MP4 path for current segment
 let ffmpegStarted   = false;   // true once FFmpeg has been spawned
 
 // Audio pre-roll buffer — holds PCM chunks that arrive before the first video
-// frame triggers FFmpeg start.  Discarded when FFmpeg starts (we don't want
-// pre-video audio in the recording).
+// frame triggers FFmpeg start.  Discarded when FFmpeg starts (pre-video audio
+// must not be included — it would push audio ahead of the lips).
 let audioPrebuffer  = [];      // Array<Buffer>
-
-// Video delay queue — holds encoded YUV frames for VIDEO_DELAY_MS before
-// writing to FFmpeg.  This compensates for the avatar's audio arriving at the
-// recorder slightly later than the video (network path difference).
-// At 30 fps, 1500 ms = 45 frames.  Tune VIDEO_DELAY_MS if sync is still off.
-const VIDEO_DELAY_MS = 1500;
-const VIDEO_DELAY_FRAMES = Math.round(VIDEO_FPS * VIDEO_DELAY_MS / 1000); // 45
-let videoDelayQueue = [];   // Array<{y,u,v}> — buffered frames not yet sent to FFmpeg
 
 // ── Callback to recorder.py ───────────────────────────────────────────────────
 function notifySegmentComplete(mergedPath, s3Url, segIdx) {
@@ -186,20 +186,23 @@ function segmentPath(idx) {
 
 // ── Start a single FFmpeg process for one segment ─────────────────────────────
 // Video arrives on pipe:3 (raw YUV420p), audio arrives on pipe:4 (raw s16le PCM).
-// FFmpeg muxes both on a shared clock and writes directly to an MP4 file.
+// -itsoffset on the audio input tells FFmpeg that audio starts AUDIO_OFFSET_SECS
+// seconds into the video timeline, compensating for the network delay difference
+// between the avatar's video and audio paths.
 function startFFmpegSegment(idx, width, height) {
   const outPath = segmentPath(idx);
-  console.log(`[lk-rec] Starting FFmpeg segment ${idx}: ${outPath} (${width}x${height})`);
+  console.log(`[lk-rec] Starting FFmpeg segment ${idx}: ${outPath} (${width}x${height}) audio_offset=${AUDIO_OFFSET_SECS}s`);
 
   const proc = spawn('ffmpeg', [
     '-y',
-    // Video input on pipe:3
+    // Video input on pipe:3 — no offset, starts at t=0
     '-f', 'rawvideo', '-pix_fmt', 'yuv420p',
     '-s', `${width}x${height}`,
     '-r', String(VIDEO_FPS),
     '-thread_queue_size', '512',
     '-i', 'pipe:3',
-    // Audio input on pipe:4
+    // Audio input on pipe:4 — offset by AUDIO_OFFSET_SECS so it aligns with lips
+    '-itsoffset', AUDIO_OFFSET_SECS,
     '-f', 's16le', '-ar', String(AUDIO_SAMPLE_RATE), '-ac', String(AUDIO_CHANNELS),
     '-thread_queue_size', '512',
     '-i', 'pipe:4',
@@ -211,7 +214,7 @@ function startFFmpegSegment(idx, width, height) {
     '-movflags', '+faststart',
     outPath,
   ], {
-    // stdin=ignore, stdout=pipe, stderr=pipe, pipe:3=pipe, pipe:4=pipe
+    // stdin=ignore, stdout=inherit, stderr=inherit, pipe:3=pipe, pipe:4=pipe
     stdio: ['ignore', 'inherit', 'inherit', 'pipe', 'pipe'],
   });
 
@@ -344,13 +347,12 @@ function startVideoCapture(track) {
             segmentStartMs = Date.now();
             ffmpegStarted  = true;
 
-            // Discard the audio prebuffer — pre-video audio should not be
-            // included in the recording.  Audio encoding starts fresh from t=0.
+            // Discard the audio prebuffer — pre-video audio must not be included
+            // because it would push audio ahead of the lips in the recording.
             if (audioPrebuffer.length > 0) {
-              console.log(`[lk-rec] Discarding ${audioPrebuffer.length} pre-video audio frames (A/V sync)`);
+              console.log(`[lk-rec] Discarding ${audioPrebuffer.length} pre-video audio frames`);
               audioPrebuffer = [];
             }
-            console.log(`[lk-rec] Video delay queue: ${VIDEO_DELAY_FRAMES} frames (${VIDEO_DELAY_MS}ms) — buffering before write`);
 
             firstFrame = false;
           }
@@ -361,20 +363,10 @@ function startVideoCapture(track) {
           const uPlane = i420.getPlane(1);
           const vPlane = i420.getPlane(2);
           if (yPlane && uPlane && vPlane) {
-            // Push frame into the delay queue
-            videoDelayQueue.push({
-              y: Buffer.from(yPlane),
-              u: Buffer.from(uPlane),
-              v: Buffer.from(vPlane),
-            });
-            // Once the queue is full (delay reached), drain one frame per incoming frame
-            if (videoDelayQueue.length > VIDEO_DELAY_FRAMES) {
-              const delayed = videoDelayQueue.shift();
-              writeVideoFrame(delayed.y, delayed.u, delayed.v);
-              videoFrameCount++;
-              if (videoFrameCount % 300 === 0) {
-                console.log(`[lk-rec] Video frames: ${videoFrameCount} (${actualWidth}x${actualHeight})`);
-              }
+            writeVideoFrame(Buffer.from(yPlane), Buffer.from(uPlane), Buffer.from(vPlane));
+            videoFrameCount++;
+            if (videoFrameCount % 300 === 0) {
+              console.log(`[lk-rec] Video frames: ${videoFrameCount} (${actualWidth}x${actualHeight})`);
             }
           }
 
@@ -391,18 +383,13 @@ function startVideoCapture(track) {
     } finally {
       try { reader.releaseLock(); } catch (_) {}
     }
-    // Flush remaining frames from the delay queue
-    console.log(`[lk-rec] Flushing ${videoDelayQueue.length} delayed video frames`);
-    for (const delayed of videoDelayQueue) {
-      if (videoPipe && !videoPipe.destroyed) {
-        writeVideoFrame(delayed.y, delayed.u, delayed.v);
-        videoFrameCount++;
-      }
-    }
-    videoDelayQueue = [];
     console.log(`[lk-rec] Video capture ended (${videoFrameCount} frames)`);
-    // Close video pipe — FFmpeg will finish encoding when audio pipe also closes
+    // Close BOTH pipes when video ends — this stops the audio tail and signals
+    // FFmpeg to finalize the file.  Audio keeps encoding after video ends otherwise,
+    // producing a 20+ second silent audio tail that desynchronizes the streams.
     try { if (videoPipe && !videoPipe.destroyed) videoPipe.end(); } catch (_) {}
+    try { if (audioPipe && !audioPipe.destroyed) audioPipe.end(); } catch (_) {}
+    console.log('[lk-rec] Both pipes closed — FFmpeg will finalize');
   })();
 }
 
@@ -441,7 +428,7 @@ function startAudioCapture(track) {
       try { reader.releaseLock(); } catch (_) {}
     }
     console.log(`[lk-rec] Audio capture ended (${audioFrameCount} frames)`);
-    // Close audio pipe — FFmpeg will finish encoding once both pipes are closed
+    // Audio pipe may already be closed by video capture end — close if still open
     try { if (audioPipe && !audioPipe.destroyed) audioPipe.end(); } catch (_) {}
   })();
 }
@@ -487,6 +474,7 @@ async function main() {
   console.log(`[lk-rec] Connecting to ${LK_URL} room=${LK_ROOM}`);
   console.log(`[lk-rec] Output base: ${OUTPUT_PATH}`);
   console.log(`[lk-rec] Segment rolling: ${SEGMENT_MS > 0 ? `every ${SEGMENT_MINUTES} min` : 'disabled'}`);
+  console.log(`[lk-rec] A/V sync offset: audio delayed by ${AUDIO_OFFSET_SECS}s`);
   console.log(`[lk-rec] API key: ${LK_API_KEY}`);
 
   room = new Room();

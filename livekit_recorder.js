@@ -1,15 +1,25 @@
 
 /**
- * livekit_recorder.js  (v9 — itsoffset A/V sync)
+ * livekit_recorder.js  (v10 — two-point A/V sync trim)
  * =========================================================
  * Connects to a LiveKit room, captures avatar video + audio, and writes
  * rolling MP4 segments (H.264/AAC).
  *
  * KEY DESIGN: A single FFmpeg process receives BOTH video (pipe:3) and
- * audio (pipe:4) simultaneously.  The avatar's audio arrives at the recorder
- * ~1.2 seconds AFTER the video (network path difference).  We compensate by
- * telling FFmpeg that the audio input starts 1.2 seconds into the timeline
- * via -itsoffset, so the muxed output has video and audio perfectly aligned.
+ * audio (pipe:4) simultaneously.  After the raw segment is written, a
+ * post-processing step detects the exact lip-movement start (video) and
+ * speech start (audio) and trims both streams to align at t=0.  This
+ * handles the variable 2-3 second delay between the avatar's lip animation
+ * and its TTS audio arriving at the recorder.
+ *
+ * POST-PROCESSING TRIM (finaliseSegment):
+ *   1. silencedetect  → SPEECH_START = first silence_end timestamp
+ *   2. scdet on mouth crop (200x80 at x=540,y=370) → LIP_START = first
+ *      frame with scene-change score > 0.3
+ *   3. Two-point FFmpeg trim: video from LIP_START, audio from SPEECH_START
+ *   4. Both streams capped to (video_duration - LIP_START) so audio tail
+ *      does not extend past the video end
+ *   5. Replaces the raw segment in-place; falls back to original on error
  *
  * Usage:
  *   node livekit_recorder.js <lk_url> <lk_room> <output_path>
@@ -35,7 +45,7 @@ const {
 
 const { AccessToken } = require('livekit-server-sdk');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
-const { spawn } = require('child_process');
+const { spawn, execFile } = require('child_process');
 const fs   = require('fs');
 const http = require('http');
 const https = require('https');
@@ -106,11 +116,13 @@ const AUDIO_SAMPLE_RATE = 48000;
 const AUDIO_CHANNELS    = 1;
 const SEGMENT_MS        = SEGMENT_MINUTES > 0 ? SEGMENT_MINUTES * 60 * 1000 : 0;
 
-// A/V sync offset: the avatar's audio arrives at the recorder ~1.2 seconds
-// after the video due to network path differences.  We tell FFmpeg to place
-// the audio stream 1.2 seconds into the video timeline so lips and voice align.
-// Increase if audio is still behind; decrease if audio is ahead.
-const AUDIO_OFFSET_SECS = '1.2';
+// Mouth crop region for lip-movement detection (1280x720 frame)
+// width=200, height=80, x=540, y=370 — covers the avatar's lips
+const MOUTH_CROP = 'crop=200:80:540:370';
+
+// Scene-change score threshold for lip detection.
+// Idle face: scores 0.1–0.25.  Active lips: scores 0.3+.
+const LIP_SCORE_THRESHOLD = 0.3;
 
 // ── Token ─────────────────────────────────────────────────────────────────────
 async function makeToken(room) {
@@ -121,7 +133,9 @@ async function makeToken(room) {
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let stopping        = false;
+let stopping            = false;
+let videoEnded          = false;   // set when video capture loop exits
+let gracefulStopCalled  = false;   // prevents double-entry into gracefulStop
 let room            = null;
 let videoStream     = null;
 let audioStream     = null;
@@ -186,12 +200,10 @@ function segmentPath(idx) {
 
 // ── Start a single FFmpeg process for one segment ─────────────────────────────
 // Video arrives on pipe:3 (raw YUV420p), audio arrives on pipe:4 (raw s16le PCM).
-// -itsoffset on the audio input tells FFmpeg that audio starts AUDIO_OFFSET_SECS
-// seconds into the video timeline, compensating for the network delay difference
-// between the avatar's video and audio paths.
+// No -itsoffset is used here — the post-processing trim handles sync precisely.
 function startFFmpegSegment(idx, width, height) {
   const outPath = segmentPath(idx);
-  console.log(`[lk-rec] Starting FFmpeg segment ${idx}: ${outPath} (${width}x${height}) audio_offset=${AUDIO_OFFSET_SECS}s`);
+  console.log(`[lk-rec] Starting FFmpeg segment ${idx}: ${outPath} (${width}x${height})`);
 
   const proc = spawn('ffmpeg', [
     '-y',
@@ -201,8 +213,7 @@ function startFFmpegSegment(idx, width, height) {
     '-r', String(VIDEO_FPS),
     '-thread_queue_size', '512',
     '-i', 'pipe:3',
-    // Audio input on pipe:4 — offset by AUDIO_OFFSET_SECS so it aligns with lips
-    '-itsoffset', AUDIO_OFFSET_SECS,
+    // Audio input on pipe:4 — no offset; post-processing trim handles sync
     '-f', 's16le', '-ar', String(AUDIO_SAMPLE_RATE), '-ac', String(AUDIO_CHANNELS),
     '-thread_queue_size', '512',
     '-i', 'pipe:4',
@@ -226,14 +237,174 @@ function startFFmpegSegment(idx, width, height) {
   return { proc, outPath };
 }
 
+// ── Run a shell command and return stdout+stderr as a string ──────────────────
+function runCommand(cmd, args) {
+  return new Promise((resolve, reject) => {
+    let out = '';
+    const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    proc.stdout.on('data', d => { out += d.toString(); });
+    proc.stderr.on('data', d => { out += d.toString(); });
+    proc.on('error', reject);
+    proc.on('exit', () => resolve(out));
+  });
+}
+
+// ── Detect speech start time (first silence_end) ──────────────────────────────
+async function detectSpeechStart(filePath) {
+  try {
+    const out = await runCommand('ffmpeg', [
+      '-y', '-i', filePath,
+      '-af', 'silencedetect=noise=-40dB:duration=0.3',
+      '-f', 'null', '-',
+    ]);
+    // Parse: "silence_end: 8.99137 | silence_duration: ..."
+    const match = out.match(/silence_end:\s*([\d.]+)/);
+    if (match) {
+      const t = parseFloat(match[1]);
+      console.log(`[lk-rec] detectSpeechStart: ${t}s`);
+      return t;
+    }
+    console.warn('[lk-rec] detectSpeechStart: no silence_end found — audio may be all speech or all silent');
+    return null;
+  } catch (e) {
+    console.error('[lk-rec] detectSpeechStart error:', e.message);
+    return null;
+  }
+}
+
+// ── Detect lip movement start time (first scdet score > threshold) ────────────
+async function detectLipStart(filePath) {
+  try {
+    const out = await runCommand('ffmpeg', [
+      '-y', '-i', filePath,
+      '-vf', `${MOUTH_CROP},scdet=threshold=0.1:sc_pass=1`,
+      '-f', 'null', '-',
+    ]);
+    // Parse lines like: lavfi.scd.score: 0.634, lavfi.scd.time: 6.43333
+    const lines = out.split('\n');
+    for (const line of lines) {
+      const m = line.match(/scd\.score:\s*([\d.]+),\s*lavfi\.scd\.time:\s*([\d.]+)/);
+      if (m) {
+        const score = parseFloat(m[1]);
+        const time  = parseFloat(m[2]);
+        if (score >= LIP_SCORE_THRESHOLD) {
+          console.log(`[lk-rec] detectLipStart: ${time}s (score=${score})`);
+          return time;
+        }
+      }
+    }
+    console.warn('[lk-rec] detectLipStart: no lip movement detected above threshold');
+    return null;
+  } catch (e) {
+    console.error('[lk-rec] detectLipStart error:', e.message);
+    return null;
+  }
+}
+
+// ── Get video duration via ffprobe ────────────────────────────────────────────
+async function getVideoDuration(filePath) {
+  try {
+    const out = await runCommand('ffprobe', [
+      '-v', 'quiet',
+      '-show_entries', 'stream=duration',
+      '-select_streams', 'v:0',
+      '-of', 'csv=p=0',
+      filePath,
+    ]);
+    const dur = parseFloat(out.trim());
+    if (!isNaN(dur) && dur > 0) return dur;
+    // Fallback: format duration
+    const out2 = await runCommand('ffprobe', [
+      '-v', 'quiet',
+      '-show_entries', 'format=duration',
+      '-of', 'csv=p=0',
+      filePath,
+    ]);
+    return parseFloat(out2.trim());
+  } catch (e) {
+    console.error('[lk-rec] getVideoDuration error:', e.message);
+    return null;
+  }
+}
+
+// ── Two-point sync trim ───────────────────────────────────────────────────────
+// Trims video from lipStart and audio from speechStart, joining both at t=0.
+// Caps both streams to (videoDuration - lipStart) so audio tail is removed.
+// Writes result to a temp file then replaces the original in-place.
+async function syncTrimSegment(filePath) {
+  console.log(`[lk-rec] syncTrimSegment: starting post-processing on ${filePath}`);
+
+  const speechStart = await detectSpeechStart(filePath);
+  const lipStart    = await detectLipStart(filePath);
+  const videoDur    = await getVideoDuration(filePath);
+
+  if (speechStart === null || lipStart === null || videoDur === null) {
+    console.warn('[lk-rec] syncTrimSegment: detection failed — keeping original file');
+    return;
+  }
+
+  if (speechStart <= 0 && lipStart <= 0) {
+    console.log('[lk-rec] syncTrimSegment: both starts at t=0 — no trim needed');
+    return;
+  }
+
+  const trimDur = videoDur - lipStart;
+  if (trimDur <= 0) {
+    console.warn(`[lk-rec] syncTrimSegment: trimDur=${trimDur} <= 0 — skipping`);
+    return;
+  }
+
+  console.log(`[lk-rec] syncTrimSegment: lipStart=${lipStart}s speechStart=${speechStart}s videoDur=${videoDur}s trimDur=${trimDur}s`);
+
+  const tmpPath = filePath + '.syncing.mp4';
+  try {
+    const out = await runCommand('ffmpeg', [
+      '-y',
+      '-ss', String(lipStart),    '-i', filePath,   // video input, seek to lip start
+      '-ss', String(speechStart), '-i', filePath,   // audio input, seek to speech start
+      '-map', '0:v', '-map', '1:a',
+      '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+      '-c:a', 'aac', '-b:a', '128k',
+      '-t', String(trimDur),
+      '-shortest',
+      '-movflags', '+faststart',
+      tmpPath,
+    ]);
+
+    if (!fs.existsSync(tmpPath) || fs.statSync(tmpPath).size === 0) {
+      console.error('[lk-rec] syncTrimSegment: trim produced empty file — keeping original');
+      try { fs.unlinkSync(tmpPath); } catch (_) {}
+      return;
+    }
+
+    // Verify output durations
+    const outDur = await getVideoDuration(tmpPath);
+    console.log(`[lk-rec] syncTrimSegment: output duration=${outDur}s (expected ~${trimDur}s)`);
+
+    // Replace original with trimmed version
+    fs.renameSync(tmpPath, filePath);
+    console.log(`[lk-rec] syncTrimSegment: replaced ${filePath} with synced version`);
+  } catch (e) {
+    console.error('[lk-rec] syncTrimSegment: trim failed:', e.message);
+    try { fs.unlinkSync(tmpPath); } catch (_) {}
+  }
+}
+
 // ── Upload and notify after a segment file is complete ────────────────────────
-function finaliseSegment(outPath, idx) {
+async function finaliseSegment(outPath, idx) {
   const sz = fs.existsSync(outPath) ? fs.statSync(outPath).size : 0;
-  console.log(`[lk-rec] Segment ${idx} complete: ${outPath} (${sz} bytes)`);
+  console.log(`[lk-rec] Segment ${idx} raw complete: ${outPath} (${sz} bytes)`);
   if (sz === 0) {
     console.warn(`[lk-rec] Segment ${idx}: empty file — skipping upload`);
     return;
   }
+
+  // Run two-point sync trim before uploading
+  await syncTrimSegment(outPath);
+
+  const sz2 = fs.existsSync(outPath) ? fs.statSync(outPath).size : 0;
+  console.log(`[lk-rec] Segment ${idx} post-trim: ${outPath} (${sz2} bytes)`);
+
   uploadToS3(outPath, idx)
     .then(url => {
       notifySegmentComplete(outPath, url, idx);
@@ -249,18 +420,21 @@ function finaliseSegment(outPath, idx) {
 function closeFFmpegSegment(proc, idx) {
   return new Promise((resolve) => {
     if (!proc) { resolve(); return; }
-
+    // If process already exited, resolve immediately
+    if (proc.exitCode !== null || proc.killed) {
+      console.log(`[lk-rec] FFmpeg seg${idx} already exited (code=${proc.exitCode})`);
+      resolve();
+      return;
+    }
     const timeout = setTimeout(() => {
       console.warn(`[lk-rec] FFmpeg seg${idx} close timeout — killing`);
       try { proc.kill(); } catch (_) {}
       resolve();
     }, 15000);
-
     proc.once('exit', () => {
       clearTimeout(timeout);
       resolve();
     });
-
     // Close both input pipes to signal EOF to FFmpeg
     try { if (proc.stdio[3] && !proc.stdio[3].destroyed) proc.stdio[3].end(); } catch (_) {}
     try { if (proc.stdio[4] && !proc.stdio[4].destroyed) proc.stdio[4].end(); } catch (_) {}
@@ -384,9 +558,11 @@ function startVideoCapture(track) {
       try { reader.releaseLock(); } catch (_) {}
     }
     console.log(`[lk-rec] Video capture ended (${videoFrameCount} frames)`);
-    // Signal the audio loop to stop — without this it keeps running and encodes
-    // 20+ seconds of silent audio after the video ends.
-    stopping = true;
+
+    // Signal the audio loop to stop — videoEnded flag is checked by audio loop
+    videoEnded = true;
+    stopping   = true;
+
     // Close BOTH pipes to signal EOF to FFmpeg
     try { if (videoPipe && !videoPipe.destroyed) videoPipe.end(); } catch (_) {}
     try { if (audioPipe && !audioPipe.destroyed) audioPipe.end(); } catch (_) {}
@@ -406,9 +582,9 @@ function startAudioCapture(track) {
 
   (async () => {
     try {
-      while (!stopping) {
+      while (!stopping && !videoEnded) {
         const { done, value: frame } = await reader.read();
-        if (done || stopping) break;
+        if (done || stopping || videoEnded) break;
         try {
           const buf = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
           if (!ffmpegStarted) {
@@ -436,8 +612,10 @@ function startAudioCapture(track) {
 
 // ── Graceful stop ─────────────────────────────────────────────────────────────
 async function gracefulStop() {
-  if (stopping) return;
-  stopping = true;
+  if (gracefulStopCalled) return;
+  gracefulStopCalled = true;
+  stopping   = true;
+  videoEnded = true;
 
   console.log('[lk-rec] Stopping capture...');
 
@@ -461,8 +639,8 @@ async function gracefulStop() {
     process.exit(1);
   }
 
-  // Upload the final segment
-  finaliseSegment(currentOut, segmentIndex);
+  // Upload the final segment (includes post-processing trim)
+  await finaliseSegment(currentOut, segmentIndex);
 
   // Give the async upload a moment to start before exiting
   await new Promise(r => setTimeout(r, 2000));
@@ -475,7 +653,7 @@ async function main() {
   console.log(`[lk-rec] Connecting to ${LK_URL} room=${LK_ROOM}`);
   console.log(`[lk-rec] Output base: ${OUTPUT_PATH}`);
   console.log(`[lk-rec] Segment rolling: ${SEGMENT_MS > 0 ? `every ${SEGMENT_MINUTES} min` : 'disabled'}`);
-  console.log(`[lk-rec] A/V sync offset: audio delayed by ${AUDIO_OFFSET_SECS}s`);
+  console.log(`[lk-rec] A/V sync: two-point post-processing trim (lip+speech detection)`);
   console.log(`[lk-rec] API key: ${LK_API_KEY}`);
 
   room = new Room();

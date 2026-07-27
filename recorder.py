@@ -135,7 +135,15 @@ def _notify_relay(session_id: str, amplinar_id: str, recording_url: str,
 
 # ── FFmpeg concat ─────────────────────────────────────────────────────────────
 def _concat_segments(segment_paths: list) -> bytes:
-    """Concatenate a list of WebM/MP4 segment files into one WebM."""
+    """Concatenate a list of MP4 segment files into one MP4.
+
+    Strategy:
+      1. Try fast stream-copy (-c copy) — works when all segments have identical
+         codec parameters (the common case).
+      2. If that fails (mismatched codec params, e.g. different resolutions or
+         bitrates across LiveKit segments), fall back to a full re-encode with
+         libx264/aac which handles any combination of inputs.
+    """
     if len(segment_paths) == 1:
         with open(segment_paths[0], "rb") as f:
             return f.read()
@@ -149,16 +157,30 @@ def _concat_segments(segment_paths: list) -> bytes:
         out_path = outf.name
 
     try:
+        # Pass 1: fast stream-copy
         result = subprocess.run(
             ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
-             "-c:v", "libvpx", "-b:v", "1500k", "-deadline", "realtime", "-cpu-used", "8",
-             "-c:a", "libopus", "-b:a", "128k",
+             "-c", "copy",
              out_path],
             capture_output=True,
         )
         if result.returncode != 0:
-            logger.error(f"[FFmpeg] concat failed: {result.stderr.decode()[-500:]}")
-            raise RuntimeError("FFmpeg concat failed")
+            logger.warning(f"[FFmpeg] concat stream-copy failed (will re-encode): {result.stderr.decode()[-300:]}")
+            # Pass 2: full re-encode — handles mismatched codec parameters
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+                 "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                 "-c:a", "aac", "-b:a", "128k",
+                 "-movflags", "+faststart",
+                 out_path],
+                capture_output=True,
+            )
+            if result.returncode != 0:
+                logger.error(f"[FFmpeg] concat re-encode failed: {result.stderr.decode()[-500:]}")
+                raise RuntimeError("FFmpeg concat failed")
+            logger.info("[FFmpeg] concat completed via re-encode fallback")
+        else:
+            logger.info("[FFmpeg] concat completed via stream-copy")
         with open(out_path, "rb") as f:
             return f.read()
     finally:

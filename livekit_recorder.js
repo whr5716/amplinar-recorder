@@ -347,15 +347,22 @@ function startVideoCapture(track) {
             actualWidth  = i420.width;
             actualHeight = i420.height;
             console.log(`[lk-rec] First video frame: ${actualWidth}x${actualHeight}`);
-            // Start first FFmpeg segment now that we know the resolution
-            const { vProc, aProc, vOut, aOut } = startFFmpegSegment(0, actualWidth, actualHeight);
-            videoProc       = vProc;
-            audioProc       = aProc;
-            videoStdin      = vProc.stdin;
-            audioStdin      = aProc.stdin;
-            currentVideoOut = vOut;
-            currentAudioOut = aOut;
-            segmentStartMs  = Date.now();
+            if (!videoStdin) {
+              // FFmpeg not yet started — start it now with the correct resolution
+              const { vProc, aProc, vOut, aOut } = startFFmpegSegment(0, actualWidth, actualHeight);
+              videoProc       = vProc;
+              audioProc       = aProc;
+              videoStdin      = vProc.stdin;
+              audioStdin      = aProc.stdin;
+              currentVideoOut = vOut;
+              currentAudioOut = aOut;
+              segmentStartMs  = Date.now();
+            } else {
+              // FFmpeg was already started by startAudioCapture (audio arrived first).
+              // The resolution may differ from the default — but we can't restart mid-stream.
+              // Log the actual resolution for reference.
+              console.log(`[lk-rec] FFmpeg already running (started by audio) — video resolution: ${actualWidth}x${actualHeight}`);
+            }
             firstFrame = false;
           }
 
@@ -393,21 +400,27 @@ function startAudioCapture(track) {
   audioStream = new AudioStream(track, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS);
   const reader = audioStream.getReader();
 
+  // If FFmpeg hasn't started yet (no video track yet), start it now with default resolution.
+  // It will be restarted with the correct resolution when the first video frame arrives.
+  if (!audioStdin) {
+    console.log('[lk-rec] Audio track arrived before video — starting FFmpeg with default resolution');
+    const { vProc, aProc, vOut, aOut } = startFFmpegSegment(0, actualWidth, actualHeight);
+    videoProc       = vProc;
+    audioProc       = aProc;
+    videoStdin      = vProc.stdin;
+    audioStdin      = aProc.stdin;
+    currentVideoOut = vOut;
+    currentAudioOut = aOut;
+    segmentStartMs  = Date.now();
+  }
+
   (async () => {
     try {
       while (!stopping) {
         const { done, value: frame } = await reader.read();
         if (done || stopping) break;
         try {
-          // Wait up to 5s for audioStdin to become available (set when first video frame arrives)
-          if (!audioStdin || audioStdin.destroyed) {
-            let waited = 0;
-            while ((!audioStdin || audioStdin.destroyed) && !stopping && waited < 5000) {
-              await new Promise(r => setTimeout(r, 50));
-              waited += 50;
-            }
-            if (!audioStdin || audioStdin.destroyed) continue;
-          }
+          if (!audioStdin || audioStdin.destroyed) continue;
           const buf = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
           audioStdin.write(buf);
           audioFrameCount++;

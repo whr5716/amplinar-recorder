@@ -137,10 +137,14 @@ let currentAudioOut = null;
 let segmentRolling  = false;  // true while a roll is in progress
 
 // Audio pre-roll buffer: holds PCM chunks received before the first video frame.
-// Flushed into audioStdin the moment FFmpeg starts (triggered by first video frame).
-// This ensures audio and video start at exactly the same wall-clock moment.
-let audioPrebuffer  = [];     // Array<Buffer> — PCM chunks waiting for FFmpeg to start
-let ffmpegStarted   = false;  // true once startFFmpegSegment(0,...) has been called
+let audioPrebuffer      = [];     // Array<Buffer> — PCM chunks waiting for FFmpeg to start
+let ffmpegStarted       = false;  // true once startFFmpegSegment(0,...) has been called
+
+// Sync timestamps — wall-clock ms when the first frame of each type arrived.
+// The difference (audioStartMs - videoStartMs) is the audio head-start that
+// causes lip-sync offset. We pass it as -itsoffset to FFmpeg at merge time.
+let firstAudioMs        = 0;   // Date.now() when first audio frame arrived
+let firstVideoMs        = 0;   // Date.now() when first video frame arrived (= FFmpeg start)
 
 // ── Callback to recorder.py ───────────────────────────────────────────────────
 function notifySegmentComplete(videoPath, audioPath, segIdx) {
@@ -287,9 +291,26 @@ function mergeSegment(vOut, aOut, mergedOut, idx) {
 
   let args;
   if (vExists && aExists) {
-    // Mux H.264 video + AAC audio into MP4
-    args = ['-y', '-i', vOut, '-i', aOut, '-c:v', 'copy', '-c:a', 'copy',
-            '-movflags', '+faststart', mergedOut];
+    // Calculate audio head-start: how many seconds of audio arrived before the first video frame.
+    // If audio started before video (firstAudioMs < firstVideoMs), the audio file has extra
+    // content at the start that needs to be trimmed. We use -itsoffset on the audio input
+    // to tell FFmpeg to skip that many seconds from the start of the audio stream.
+    const audioHeadStartSec = (firstVideoMs > 0 && firstAudioMs > 0 && firstAudioMs < firstVideoMs)
+      ? (firstVideoMs - firstAudioMs) / 1000
+      : 0;
+    console.log(`[lk-rec] Seg${idx} merge: audioHeadStart=${audioHeadStartSec.toFixed(3)}s (audioMs=${firstAudioMs}, videoMs=${firstVideoMs})`);
+    if (audioHeadStartSec > 0.05) {
+      // Trim the audio head-start by seeking into the audio file before muxing
+      args = ['-y',
+              '-i', vOut,
+              '-ss', audioHeadStartSec.toFixed(6), '-i', aOut,
+              '-c:v', 'copy', '-c:a', 'copy',
+              '-movflags', '+faststart', mergedOut];
+    } else {
+      // No meaningful offset — mux directly
+      args = ['-y', '-i', vOut, '-i', aOut, '-c:v', 'copy', '-c:a', 'copy',
+              '-movflags', '+faststart', mergedOut];
+    }
   } else if (vExists) {
     args = ['-y', '-i', vOut, '-c', 'copy', '-movflags', '+faststart', mergedOut];
   } else if (aExists) {
@@ -352,10 +373,8 @@ function startVideoCapture(track) {
           if (firstFrame) {
             actualWidth  = i420.width;
             actualHeight = i420.height;
-            console.log(`[lk-rec] First video frame: ${actualWidth}x${actualHeight}`);
-            // Always start FFmpeg on first video frame — this is the sync point.
-            // Audio frames received before this moment are in audioPrebuffer and will
-            // be flushed immediately after FFmpeg starts, so A/V starts at the same time.
+            firstVideoMs = Date.now();
+            console.log(`[lk-rec] First video frame: ${actualWidth}x${actualHeight} at t=${firstVideoMs}`);
             const { vProc, aProc, vOut, aOut } = startFFmpegSegment(0, actualWidth, actualHeight);
             videoProc       = vProc;
             audioProc       = aProc;
@@ -363,13 +382,12 @@ function startVideoCapture(track) {
             audioStdin      = aProc.stdin;
             currentVideoOut = vOut;
             currentAudioOut = aOut;
-            segmentStartMs  = Date.now();
+            segmentStartMs  = firstVideoMs;
             ffmpegStarted   = true;
-            // Flush any audio that arrived before the first video frame.
-            // These frames are discarded (not written) because they predate the video.
-            // This keeps A/V in sync: both streams start from t=0 together.
+            // Discard any audio buffered before the first video frame — those frames
+            // predate the video and would cause audio to run ahead of the lips.
             if (audioPrebuffer.length > 0) {
-              console.log(`[lk-rec] Discarding ${audioPrebuffer.length} pre-video audio frames (sync alignment)`);
+              console.log(`[lk-rec] Discarding ${audioPrebuffer.length} pre-video audio frames`);
               audioPrebuffer = [];
             }
             firstFrame = false;
@@ -425,9 +443,12 @@ function startAudioCapture(track) {
         try {
           const buf = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
           if (!ffmpegStarted) {
-            // FFmpeg not yet started — buffer this PCM chunk
+            // FFmpeg not yet started — buffer this PCM chunk and record when audio first arrived
+            if (firstAudioMs === 0) {
+              firstAudioMs = Date.now();
+              console.log(`[lk-rec] First audio frame at t=${firstAudioMs}`);
+            }
             audioPrebuffer.push(buf);
-            // Cap prebuffer at ~30s (30s * 48000 * 2 bytes * 1ch / ~960 bytes per frame ≈ 3000 frames)
             if (audioPrebuffer.length > 3000) audioPrebuffer.shift();
           } else {
             // FFmpeg is running — write directly

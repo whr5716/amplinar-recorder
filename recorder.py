@@ -416,16 +416,33 @@ def _recording_worker(rec: dict) -> None:
         base = lk_out.replace('.mp4', '') if lk_out else ''
         seg_files = sorted(_glob.glob(f"{base}_seg*.mp4")) if base else []
         found = []
+        def _has_streams(path: str) -> bool:
+            """Return True if the file has at least one valid video or audio stream."""
+            try:
+                result = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
+                     "-of", "default=noprint_wrappers=1:nokey=1", path],
+                    capture_output=True, timeout=10
+                )
+                output = result.stdout.decode().strip()
+                return bool(output)  # non-empty means at least one stream found
+            except Exception:
+                return False
+
         if seg_files:
             for sf in seg_files:
                 sz = os.path.getsize(sf)
                 logger.info(f"[Recorder:{session_id}] Found segment: {sf} ({sz:,} bytes)")
-                if sz > 0:
+                if sz > 0 and _has_streams(sf):
                     found.append(sf)
+                elif sz > 0:
+                    logger.warning(f"[Recorder:{session_id}] LiveKit segment has no streams — skipping: {sf}")
         else:
             sz = os.path.getsize(lk_out) if lk_out and os.path.exists(lk_out) else 0
-            if sz > 0:
+            if sz > 0 and _has_streams(lk_out):
                 found.append(lk_out)
+            elif sz > 0:
+                logger.warning(f"[Recorder:{session_id}] LiveKit segment has no streams — skipping: {lk_out}")
             else:
                 logger.warning(f"[Recorder:{session_id}] LiveKit segment empty — skipping")
 

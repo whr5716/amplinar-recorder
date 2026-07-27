@@ -336,11 +336,21 @@ function startVideoCapture(track) {
             segmentStartMs = Date.now();
             ffmpegStarted  = true;
 
-            // Discard any audio buffered before the first video frame.
-            // Those frames represent audio that played BEFORE the video stream started —
-            // flushing them into FFmpeg would push audio ~23s ahead of the lips.
+            // Flush the tail of the audio prebuffer into FFmpeg.
+            // The prebuffer holds audio that arrived before the first video frame.
+            // We keep the last ~1.5 seconds (≈72 frames at 48kHz/1024 samples)
+            // because those frames correspond to the avatar's first words which
+            // start at roughly the same time as the first video frame.
+            // Frames older than 1.5s are discarded to avoid audio running ahead.
+            const KEEP_FRAMES = 72; // ~1.5 seconds of audio at 48kHz/1024 samples
             if (audioPrebuffer.length > 0) {
-              console.log(`[lk-rec] Discarding ${audioPrebuffer.length} pre-video audio frames (A/V sync)`);
+              const tail = audioPrebuffer.slice(-KEEP_FRAMES);
+              const discarded = audioPrebuffer.length - tail.length;
+              console.log(`[lk-rec] Flushing ${tail.length} prebuffer frames into FFmpeg (discarded ${discarded} older frames)`);
+              for (const buf of tail) {
+                writeAudioFrame(buf);
+                audioFrameCount++;
+              }
               audioPrebuffer = [];
             }
 

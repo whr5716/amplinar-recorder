@@ -519,6 +519,28 @@ def _recording_worker(rec: dict) -> None:
 
         # ── Post-recording: concat + upload ───────────────────────────────────
         valid_segments = [f for f in segment_files if os.path.exists(f) and os.path.getsize(f) > 0]
+
+        # v10+ of livekit_recorder.js uploads segments to S3 and deletes local files
+        # before recorder.py can collect them. If no local files remain, fall back to
+        # the S3 URLs that were registered via /segment-complete callbacks.
+        _s3_fallback_tmp: list = []
+        if not valid_segments and segment_s3_urls:
+            logger.info(f"[Recorder:{session_id}] No local segments — downloading {len(segment_s3_urls)} S3 segment(s) for stitching")
+            try:
+                s3 = _s3_client()
+                for i, s3url in enumerate(segment_s3_urls):
+                    key = s3url.split(f"{S3_BUCKET_NAME}.s3.{S3_REGION}.amazonaws.com/")[-1]
+                    tf = tempfile.NamedTemporaryFile(suffix=f"_s3dl_{i:03d}.mp4", delete=False)
+                    tf.close()
+                    logger.info(f"[Recorder:{session_id}] Downloading S3 segment {i}: {key}")
+                    s3.download_file(S3_BUCKET_NAME, key, tf.name)
+                    sz = os.path.getsize(tf.name)
+                    logger.info(f"[Recorder:{session_id}] Downloaded {sz:,} bytes -> {tf.name}")
+                    _s3_fallback_tmp.append(tf.name)
+                valid_segments = [f for f in _s3_fallback_tmp if os.path.getsize(f) > 0]
+            except Exception as _s3dl_err:
+                logger.error(f"[Recorder:{session_id}] S3 fallback download failed: {_s3dl_err}")
+
         if not valid_segments:
             raise RuntimeError("No valid segment files to stitch")
 
@@ -555,6 +577,12 @@ def _recording_worker(rec: dict) -> None:
 
         # Clean up local segment files only after successful completion
         for f in segment_files:
+            try:
+                os.unlink(f)
+            except Exception:
+                pass
+        # Clean up S3 fallback temp files (downloaded for stitching)
+        for f in _s3_fallback_tmp:
             try:
                 os.unlink(f)
             except Exception:

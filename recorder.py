@@ -443,6 +443,10 @@ def _recording_worker(rec: dict) -> None:
             s3_url = _upload_segment_to_s3(sf, session_id, amplinar_id, seg_index, "lk")
             if s3_url:
                 segment_s3_urls.append(s3_url)
+                # Register each real segment in the relay DB so it appears in the
+                # recordings tab under the full recording for this session.
+                _notify_relay(session_id, amplinar_id, s3_url,
+                              title=rec.get("amplinar_title", ""))
             seg_index += 1
 
         # Clean up placeholder only (not the actual segment files — those stay until success)
@@ -629,8 +633,15 @@ def segment_complete():
             if "segment_s3_urls" not in active_rec:
                 active_rec["segment_s3_urls"] = []
             active_rec["segment_s3_urls"].append(s3_url)
-        _notify_relay(session_id, amplinar_id, s3_url,
-                      title=active_rec.get("amplinar_title", "") if active_rec else "")
+        # Only register real segments in the relay DB — skip tiny placeholder files
+        # (livekit_recorder.js creates small _seg001.mp4 placeholders that are not
+        # real recordings; real segments are in the /segments/ subfolder with _lk_ or _vid_ in the name)
+        is_real_segment = '/segments/' in s3_url and ('_lk_' in s3_url or '_vid_' in s3_url)
+        if is_real_segment:
+            _notify_relay(session_id, amplinar_id, s3_url,
+                          title=active_rec.get("amplinar_title", "") if active_rec else "")
+        else:
+            logger.info(f"[Segment] Skipping relay notify for placeholder file: {s3_url.split('/')[-1]}")
         return jsonify({"status": "ok", "segment_index": seg_idx, "url": s3_url})
 
     # Legacy fallback: local file path

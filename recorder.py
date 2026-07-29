@@ -318,6 +318,13 @@ def _relay_ws_listener(rec: dict) -> None:
                 rec["pending_video_segment"] = {"url": url, "title": title}
                 _send_lk_command(rec, "ROLL_SEGMENT")
                 rec["in_video_segment"].set()
+        elif msg_type == "segment_change":
+            # Track the current segment title so LK segments are labeled correctly
+            seg_data = msg.get("segment") or {}
+            seg_title = seg_data.get("title") or msg.get("segmentTitle") or ""
+            if seg_title:
+                rec["current_segment_title"] = seg_title
+                logger.info(f"[WS] segment_change: title={seg_title!r}")
         elif msg_type == "video_segment_end":
             logger.info("[WS] video_segment_end")
             rec["in_video_segment"].clear()
@@ -445,8 +452,9 @@ def _recording_worker(rec: dict) -> None:
                 segment_s3_urls.append(s3_url)
                 # Register each real segment in the relay DB so it appears in the
                 # recordings tab under the full recording for this session.
-                _notify_relay(session_id, amplinar_id, s3_url,
-                              title=rec.get("amplinar_title", ""))
+                # Use current_segment_title (updated on segment_change) for per-segment labels.
+                _seg_label = rec.get("current_segment_title") or rec.get("amplinar_title", "")
+                _notify_relay(session_id, amplinar_id, s3_url, title=_seg_label)
             seg_index += 1
 
         # Clean up placeholder only (not the actual segment files — those stay until success)
@@ -502,6 +510,9 @@ def _recording_worker(rec: dict) -> None:
                         s3_url = _upload_segment_to_s3(tf.name, session_id, amplinar_id, seg_index, "vid")
                         if s3_url:
                             segment_s3_urls.append(s3_url)
+                            # Register video segment in relay DB so it appears in recordings tab
+                            _vid_label = seg_title or rec.get("current_segment_title") or rec.get("amplinar_title", "")
+                            _notify_relay(session_id, amplinar_id, s3_url, title=_vid_label)
                         seg_index += 1
                     except Exception as e:
                         logger.error(f"[Recorder:{session_id}] Failed to download video segment: {e}")
@@ -638,8 +649,8 @@ def segment_complete():
         # real recordings; real segments are in the /segments/ subfolder with _lk_ or _vid_ in the name)
         is_real_segment = '/segments/' in s3_url and ('_lk_' in s3_url or '_vid_' in s3_url)
         if is_real_segment:
-            _notify_relay(session_id, amplinar_id, s3_url,
-                          title=active_rec.get("amplinar_title", "") if active_rec else "")
+            _seg_cb_label = (active_rec.get("current_segment_title") or active_rec.get("amplinar_title", "")) if active_rec else ""
+            _notify_relay(session_id, amplinar_id, s3_url, title=_seg_cb_label)
         else:
             logger.info(f"[Segment] Skipping relay notify for placeholder file: {s3_url.split('/')[-1]}")
         return jsonify({"status": "ok", "segment_index": seg_idx, "url": s3_url})
@@ -664,8 +675,8 @@ def segment_complete():
                 if "segment_s3_urls" not in active_rec:
                     active_rec["segment_s3_urls"] = []
                 active_rec["segment_s3_urls"].append(url)
-            _notify_relay(session_id, amplinar_id, url,
-                          title=active_rec.get("amplinar_title", "") if active_rec else "")
+            _seg_cb_label2 = (active_rec.get("current_segment_title") or active_rec.get("amplinar_title", "")) if active_rec else ""
+            _notify_relay(session_id, amplinar_id, url, title=_seg_cb_label2)
         except Exception as e:
             logger.error(f"[Segment] Upload failed for segment {seg_idx}: {e}")
             # DO NOT delete on failure
@@ -709,6 +720,7 @@ def start_recording():
             "session_id":            session_id,
             "amplinar_id":           amplinar_id,
             "amplinar_title":        amplinar_title,
+            "current_segment_title": amplinar_title,  # updated on each segment_change
             "room_name":             room_name,
             "status":                "starting",
             "stop_event":            threading.Event(),

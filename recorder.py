@@ -142,20 +142,24 @@ def upload_bytes_to_s3(data: bytes, s3_key: str) -> str:
 
 # ── Relay notification ────────────────────────────────────────────────────────
 def _notify_relay(session_id: str, amplinar_id: str, recording_url: str,
-                  title: str = "", duration_seconds: int = 0) -> None:
+                  title: str = "", duration_seconds: int = 0,
+                  recording_type: str = None) -> None:
     if not RELAY_URL:
         return
     try:
+        payload = {
+            "session_id":       session_id,
+            "amplinar_id":      amplinar_id,
+            "title":            title,
+            "s3_url":           recording_url,
+            "duration_seconds": duration_seconds,
+            "recorded_at":      datetime.now(timezone.utc).isoformat(),
+        }
+        if recording_type:
+            payload["recording_type"] = recording_type
         resp = requests.post(
             f"{RELAY_URL}/api/session/recording-complete",
-            json={
-                "session_id":       session_id,
-                "amplinar_id":      amplinar_id,
-                "title":            title,
-                "s3_url":           recording_url,
-                "duration_seconds": duration_seconds,
-                "recorded_at":      datetime.now(timezone.utc).isoformat(),
-            },
+            json=payload,
             headers={"x-api-key": RELAY_API_KEY},
             timeout=10,
         )
@@ -454,7 +458,7 @@ def _recording_worker(rec: dict) -> None:
                 # recordings tab under the full recording for this session.
                 # Use current_segment_title (updated on segment_change) for per-segment labels.
                 _seg_label = rec.get("current_segment_title") or rec.get("amplinar_title", "")
-                _notify_relay(session_id, amplinar_id, s3_url, title=_seg_label)
+                _notify_relay(session_id, amplinar_id, s3_url, title=_seg_label, recording_type='egress')
             seg_index += 1
 
         # Clean up placeholder only (not the actual segment files — those stay until success)
@@ -512,7 +516,7 @@ def _recording_worker(rec: dict) -> None:
                             segment_s3_urls.append(s3_url)
                             # Register video segment in relay DB so it appears in recordings tab
                             _vid_label = seg_title or rec.get("current_segment_title") or rec.get("amplinar_title", "")
-                            _notify_relay(session_id, amplinar_id, s3_url, title=_vid_label)
+                            _notify_relay(session_id, amplinar_id, s3_url, title=_vid_label, recording_type='video')
                         seg_index += 1
                     except Exception as e:
                         logger.error(f"[Recorder:{session_id}] Failed to download video segment: {e}")

@@ -143,7 +143,7 @@ def upload_bytes_to_s3(data: bytes, s3_key: str) -> str:
 # ── Relay notification ────────────────────────────────────────────────────────
 def _notify_relay(session_id: str, amplinar_id: str, recording_url: str,
                   title: str = "", duration_seconds: int = 0,
-                  recording_type: str = None) -> None:
+                  recording_type: str = None, scheduled_at: str = None) -> None:
     if not RELAY_URL:
         return
     try:
@@ -157,6 +157,8 @@ def _notify_relay(session_id: str, amplinar_id: str, recording_url: str,
         }
         if recording_type:
             payload["recording_type"] = recording_type
+        if scheduled_at:
+            payload["scheduled_at"] = scheduled_at
         resp = requests.post(
             f"{RELAY_URL}/api/session/recording-complete",
             json=payload,
@@ -458,7 +460,7 @@ def _recording_worker(rec: dict) -> None:
                 # recordings tab under the full recording for this session.
                 # Use current_segment_title (updated on segment_change) for per-segment labels.
                 _seg_label = rec.get("current_segment_title") or rec.get("amplinar_title", "")
-                _notify_relay(session_id, amplinar_id, s3_url, title=_seg_label, recording_type='egress')
+                _notify_relay(session_id, amplinar_id, s3_url, title=_seg_label, recording_type='egress', scheduled_at=rec.get("scheduled_at"))
             seg_index += 1
 
         # Clean up placeholder only (not the actual segment files — those stay until success)
@@ -516,7 +518,7 @@ def _recording_worker(rec: dict) -> None:
                             segment_s3_urls.append(s3_url)
                             # Register video segment in relay DB so it appears in recordings tab
                             _vid_label = seg_title or rec.get("current_segment_title") or rec.get("amplinar_title", "")
-                            _notify_relay(session_id, amplinar_id, s3_url, title=_vid_label, recording_type='video')
+                            _notify_relay(session_id, amplinar_id, s3_url, title=_vid_label, recording_type='video', scheduled_at=rec.get("scheduled_at"))
                         seg_index += 1
                     except Exception as e:
                         logger.error(f"[Recorder:{session_id}] Failed to download video segment: {e}")
@@ -592,7 +594,8 @@ def _recording_worker(rec: dict) -> None:
         started_dt = rec.get("started_at_dt")
         duration_secs = int((now - started_dt).total_seconds()) if started_dt else 0
         _notify_relay(session_id, amplinar_id, url,
-                      title=rec.get("amplinar_title", ""), duration_seconds=duration_secs)
+                      title=rec.get("amplinar_title", ""), duration_seconds=duration_secs,
+                      scheduled_at=rec.get("scheduled_at"))
 
         # Clean up local segment files only after successful completion
         for f in segment_files:
@@ -654,7 +657,8 @@ def segment_complete():
         is_real_segment = '/segments/' in s3_url and ('_lk_' in s3_url or '_vid_' in s3_url)
         if is_real_segment:
             _seg_cb_label = (active_rec.get("current_segment_title") or active_rec.get("amplinar_title", "")) if active_rec else ""
-            _notify_relay(session_id, amplinar_id, s3_url, title=_seg_cb_label)
+            _notify_relay(session_id, amplinar_id, s3_url, title=_seg_cb_label,
+                          scheduled_at=active_rec.get("scheduled_at") if active_rec else None)
         else:
             logger.info(f"[Segment] Skipping relay notify for placeholder file: {s3_url.split('/')[-1]}")
         return jsonify({"status": "ok", "segment_index": seg_idx, "url": s3_url})
@@ -680,7 +684,8 @@ def segment_complete():
                     active_rec["segment_s3_urls"] = []
                 active_rec["segment_s3_urls"].append(url)
             _seg_cb_label2 = (active_rec.get("current_segment_title") or active_rec.get("amplinar_title", "")) if active_rec else ""
-            _notify_relay(session_id, amplinar_id, url, title=_seg_cb_label2)
+            _notify_relay(session_id, amplinar_id, url, title=_seg_cb_label2,
+                          scheduled_at=active_rec.get("scheduled_at") if active_rec else None)
         except Exception as e:
             logger.error(f"[Segment] Upload failed for segment {seg_idx}: {e}")
             # DO NOT delete on failure
@@ -709,6 +714,7 @@ def start_recording():
     session_id     = data.get("session_id")
     amplinar_id    = data.get("amplinar_id")
     amplinar_title = data.get("amplinar_title") or amplinar_id or ""
+    scheduled_at   = data.get("scheduled_at")
     room_name      = data.get("room_name") or session_id
     if not session_id or not amplinar_id:
         return jsonify({"error": "session_id and amplinar_id are required"}), 400
@@ -724,6 +730,7 @@ def start_recording():
             "session_id":            session_id,
             "amplinar_id":           amplinar_id,
             "amplinar_title":        amplinar_title,
+            "scheduled_at":          scheduled_at,
             "current_segment_title": amplinar_title,  # updated on each segment_change
             "room_name":             room_name,
             "status":                "starting",
